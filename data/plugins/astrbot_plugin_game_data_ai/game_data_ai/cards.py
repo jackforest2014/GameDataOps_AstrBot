@@ -234,6 +234,50 @@ def _table_mode_hint(series: list[dict[str, Any]]) -> str:
     )
 
 
+def _lineage_rag_block(citations: list[dict[str, Any]]) -> str:
+    """论文式尾注引用区。
+
+    飞书卡片 markdown 仅识别 font 的 red/green/grey 与枚举色名（如 wathet、blue），
+    不支持 #RRGGBB；用 text_tag + 引用块 + wathet 与正文区分。
+    """
+    if not citations:
+        return ""
+    lines = [
+        "<text_tag color='wathet'>引用内容</text_tag>",
+        "<font color='grey'>以下摘录自知识库文档，供口径与结论对照，非本次 SQL 查询结果。</font>",
+        "",
+    ]
+    for idx, c in enumerate(citations[:3], start=1):
+        title = c.get("document_title", "未命名文档")
+        proj = c.get("project_id", "")
+        loc = c.get("locator", "")
+        snippet = (c.get("snippet") or "").strip()
+        if len(snippet) > 160:
+            snippet = snippet[:160] + "…"
+        body = f"**[{idx}]** {title}."
+        if snippet:
+            body += f" 「{snippet}」"
+        meta = f"（{proj} · {loc}）" if loc else f"（{proj}）"
+        # 引用块：左侧缩进；摘录用 wathet（天蓝），定位信息用 grey
+        lines.append(f"> <font color='wathet'>{body}</font>")
+        if meta:
+            lines.append(f"> <font color='grey'>{meta}</font>")
+    return "\n".join(lines)
+
+
+def _lineage_experience_block(exp: dict[str, Any] | None) -> str:
+    if not exp:
+        return ""
+    name = exp.get("display_name", "")
+    aid = exp.get("asset_id", "")
+    ver = exp.get("version", "")
+    ver_part = f" · v{ver}" if ver else ""
+    return (
+        f"**经验复用**\n"
+        f"<font color='green'>已复用经验</font>：**{name}**（`{aid}`{ver_part}）"
+    )
+
+
 def log_card_build(payload: dict[str, Any], card: dict[str, Any]) -> None:
     answer = payload.get("answer") or {}
     rendering = payload.get("rendering") or {}
@@ -254,7 +298,9 @@ def log_card_build(payload: dict[str, Any], card: dict[str, Any]) -> None:
         "[game_data_ai] card.answer "
         f"summary={answer.get('summary', '')[:120]} "
         f"facts={answer.get('facts') or []} "
-        f"chart_series={answer.get('chart_series') or []}"
+        f"chart_series={answer.get('chart_series') or []} "
+        f"rag_citations={len(answer.get('rag_citations') or [])} "
+        f"experience_reuse={bool(answer.get('experience_reuse'))}"
     )
 
 
@@ -320,6 +366,13 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
         if hint:
             elements.append({"tag": "markdown", "content": hint})
 
+    rag_md = _lineage_rag_block(answer.get("rag_citations") or [])
+    if rag_md:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": rag_md})
+    exp_md = _lineage_experience_block(answer.get("experience_reuse"))
+    if exp_md:
+        elements.append({"tag": "markdown", "content": exp_md})
     elements.append({"tag": "hr"})
     elements.append({"tag": "markdown", "content": trace_block})
     elements.append(
