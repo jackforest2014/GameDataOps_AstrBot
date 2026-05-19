@@ -13,6 +13,12 @@ from lark_oapi.api.im.v1 import (
     GetMessageResourceRequest,
 )
 from lark_oapi.api.im.v1.processor import P2ImMessageReceiveV1Processor
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    CallBackToast,
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
+from lark_oapi.event.callback.processor import P2CardActionTriggerProcessor
 
 import astrbot.api.message_components as Comp
 from astrbot import logger
@@ -30,6 +36,7 @@ from astrbot.core.utils.webhook_utils import log_webhook_info
 
 from ...register import register_platform_adapter
 from .bot_info import request_lark_bot_info
+from .card_action_registry import dispatch_card_action
 from .lark_event import LarkMessageEvent
 from .server import LarkWebhookServer
 
@@ -62,13 +69,60 @@ class LarkPlatformAdapter(Platform):
         def do_v2_msg_event(event: lark.im.v1.P2ImMessageReceiveV1) -> None:
             asyncio.create_task(on_msg_event_recv(event))
 
+        async def on_card_action_async(event: P2CardActionTrigger) -> None:
+            try:
+                await dispatch_card_action(event)
+            except Exception as e:
+                logger.error(f"[Lark] card.action.trigger 插件处理失败: {e}", exc_info=True)
+
+        def _card_action_value(event: P2CardActionTrigger) -> dict:
+            try:
+                if (
+                    event.event
+                    and event.event.action
+                    and event.event.action.value
+                ):
+                    val = event.event.action.value
+                    return val if isinstance(val, dict) else {}
+            except Exception:
+                pass
+            return {}
+
+        def _card_action_toast(message: str) -> P2CardActionTriggerResponse:
+            resp = P2CardActionTriggerResponse()
+            toast = CallBackToast()
+            toast.type = "info"
+            toast.content = message
+            resp.toast = toast
+            return resp
+
+        def do_card_action_trigger(event: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+            value = _card_action_value(event)
+            asyncio.create_task(on_card_action_async(event))
+            if value.get("source") == "game_data_ai":
+                fb = value.get("feedback_type", "")
+                msg_map = {
+                    "good_case": "已记录：有用",
+                    "bad_case": "已记录：有问题，感谢反馈",
+                    "sql_template_candidate": "已提交模板候选，待审核",
+                }
+                logger.info(
+                    f"[Lark] card.action.trigger game_data_ai "
+                    f"trace={value.get('trace_id')} type={fb} "
+                    f"action_id={value.get('client_action_id')}"
+                )
+                return _card_action_toast(msg_map.get(fb, "已收到反馈"))
+            return P2CardActionTriggerResponse()
+
         self.event_handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(do_v2_msg_event)
+            .register_p2_card_action_trigger(do_card_action_trigger)
             .build()
         )
 
         self.do_v2_msg_event = do_v2_msg_event
+        self.do_card_action_trigger = do_card_action_trigger
 
         self.client = lark.ws.Client(
             app_id=self.appid,
@@ -613,6 +667,10 @@ class LarkPlatformAdapter(Platform):
             event_type = header.get("event_type", "")
             if event_type == "im.message.receive_v1":
                 processor = P2ImMessageReceiveV1Processor(self.do_v2_msg_event)
+                data = (processor.type())(event_data)
+                processor.do(data)
+            elif event_type == "card.action.trigger":
+                processor = P2CardActionTriggerProcessor(self.do_card_action_trigger)
                 data = (processor.type())(event_data)
                 processor.do(data)
             else:

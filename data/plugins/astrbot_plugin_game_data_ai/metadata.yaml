@@ -1,0 +1,5 @@
+name: astrbot_plugin_game_data_ai
+desc: 飞书单聊问数入口，调用 game_data_ai 平台 API 并渲染结果卡片（MVP P0）
+author: game_data_ai
+version: 0.1.0
+repo: https://github.com/jackforest2014/game_data_ai

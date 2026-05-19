@@ -19,7 +19,11 @@ cookies.json
 # Data files
 data_v2.db
 data_v3.db
-data
+data/*
+!data/plugins/
+data/plugins/*
+!data/plugins/astrbot_plugin_game_data_ai/
+!data/plugins/astrbot_plugin_game_data_ai/**
 configs/session
 configs/config.yaml
 cmd_config.json
