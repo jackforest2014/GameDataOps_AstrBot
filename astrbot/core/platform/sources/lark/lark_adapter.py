@@ -101,9 +101,11 @@ class LarkPlatformAdapter(Platform):
             asyncio.create_task(on_card_action_async(event))
             if value.get("source") == "game_data_ai":
                 fb = value.get("feedback_type", "")
+                if fb == "bad_case" and value.get("problem_type"):
+                    return _card_action_toast("已记录问题说明，感谢反馈")
                 msg_map = {
                     "good_case": "已记录：有用",
-                    "bad_case": "已记录：有问题，感谢反馈",
+                    "bad_case": "已收到，请在下一条卡片选择问题类型",
                     "sql_template_candidate": "已提交模板候选，待审核",
                 }
                 logger.info(

@@ -85,8 +85,44 @@ class GameDataAIPlugin(star.Star):
     def __init__(self, context: star.Context) -> None:
         super().__init__(context)
         self.client = GameDataAIClient()
-        register_feedback_card_handler(self.client)
+        register_feedback_card_handler(self.client, self._send_card_from_action)
         logger.info("[game_data_ai] 已注册飞书卡片按钮回调 card.action.trigger")
+
+    async def _send_card_from_action(self, _event, card_json: dict, chat_id: str) -> None:
+        """从 card.action.trigger 异步下发追问卡片（不依赖 LarkMessageEvent）。"""
+        try:
+            from astrbot.core.platform.sources.lark.lark_adapter import (
+                LarkPlatformAdapter,
+            )
+            from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
+        except ImportError:
+            return
+        adapter = None
+        for inst in self.context.platform_manager.get_insts():
+            if isinstance(inst, LarkPlatformAdapter):
+                adapter = inst
+                break
+        if adapter is None:
+            logger.warning("[game_data_ai] 未找到 Lark 适配器，追问卡片未发送")
+            return
+        lark_api = getattr(adapter, "lark_api", None)
+        if lark_api is None:
+            logger.warning("[game_data_ai] Lark API 客户端不可用")
+            return
+        try:
+            ok = await LarkMessageEvent._send_interactive_card(
+                card_json,
+                lark_client=lark_api,
+                reply_message_id=None,
+                receive_id=chat_id,
+                receive_id_type="chat_id",
+            )
+            if ok:
+                logger.info(f"[game_data_ai] lark.correction_card_sent chat={chat_id}")
+            else:
+                logger.warning("[game_data_ai] lark.correction_card_sent failed")
+        except Exception as e:
+            logger.warning(f"[game_data_ai] 追问卡片发送失败: {e}")
 
     async def terminate(self) -> None:
         pass
@@ -172,6 +208,14 @@ class GameDataAIPlugin(star.Star):
             return
 
         status = payload.get("status")
+        if status == "failed":
+            err = payload.get("error") or {}
+            if err.get("code") == "audit_write_failed":
+                yield event.plain_result(
+                    "分析结果暂未下发（审计写入失败），请稍后重试或联系管理员。"
+                )
+                return
+
         if status == "answered":
             card = build_result_card_json(payload)
             logger.info(

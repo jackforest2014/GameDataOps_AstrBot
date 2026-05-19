@@ -100,6 +100,8 @@ class GameDataAIClient:
         feedback_type: str,
         template_id: str,
         client_action_id: str,
+        problem_type: str = "",
+        comment: str = "",
     ) -> dict[str, Any]:
         path = "/api/v1/feedback"
         body_obj: dict[str, Any] = {
@@ -112,6 +114,10 @@ class GameDataAIClient:
             "client_action_id": client_action_id,
             "source": "feishu_card",
         }
+        if problem_type:
+            body_obj["problem_type"] = problem_type
+        if comment:
+            body_obj["comment"] = comment
         raw_body = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
         headers = {
             "Content-Type": "application/json",

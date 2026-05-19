@@ -9,6 +9,19 @@ from typing import Any
 from astrbot.api import logger
 
 
+_PROBLEM_TYPE_LABELS: dict[str, str] = {
+    "metric_scope_wrong": "口径不对",
+    "time_range_wrong": "时间范围不对",
+    "entity_recognition_wrong": "项目/活动识别不对",
+    "metric_selection_wrong": "指标选择不对",
+    "sql_logic_wrong": "SQL/模板逻辑有问题",
+    "interpretation_wrong": "结论解释有问题",
+    "format_wrong": "展示格式不符合预期",
+    "data_quality_issue": "数据质量/缺失/异常",
+    "other": "其他",
+}
+
+
 def _feedback_button(
     label: str,
     fb_type: str,
@@ -17,6 +30,7 @@ def _feedback_button(
     template_id: str,
     *,
     primary: bool = False,
+    problem_type: str = "",
 ) -> dict[str, Any]:
     value = {
         "source": "game_data_ai",
@@ -28,11 +42,80 @@ def _feedback_button(
         "client_action_id": f"act_{uuid.uuid4().hex[:12]}",
         "template_id": template_id,
     }
+    if problem_type:
+        value["problem_type"] = problem_type
     return {
         "tag": "button",
         "text": {"tag": "plain_text", "content": label},
         "type": "primary" if primary else "default",
         "value": value,
+    }
+
+
+def build_bad_case_correction_card(
+    *,
+    trace_id: str,
+    session_id: str,
+    template_id: str,
+    problem_types: list[str],
+) -> dict[str, Any]:
+    """TC-10：Bad Case 追问卡片（问题类型按钮）。"""
+    buttons: list[dict[str, Any]] = []
+    for pt in problem_types[:6]:
+        label = _PROBLEM_TYPE_LABELS.get(pt, pt)
+        buttons.append(
+            _feedback_button(
+                label,
+                "bad_case",
+                trace_id,
+                session_id,
+                template_id,
+                problem_type=pt,
+            )
+        )
+    rows: list[dict[str, Any]] = []
+    for i in range(0, len(buttons), 2):
+        pair = buttons[i : i + 2]
+        cols = [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [btn],
+            }
+            for btn in pair
+        ]
+        rows.append(
+            {
+                "tag": "column_set",
+                "flex_mode": "none",
+                "horizontal_spacing": "default",
+                "columns": cols,
+            }
+        )
+
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": "**请补充：本次分析哪里有问题？**\n点击下方类型即可提交（无需再打字）。",
+        },
+        {"tag": "hr"},
+        {
+            "tag": "markdown",
+            "content": f"<font color='grey'>trace: {trace_id}</font>",
+        },
+    ]
+    elements.extend(rows)
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "问题反馈 · 请选择类型"},
+            "subtitle": {"tag": "plain_text", "content": "Bad Case 追问"},
+            "template": "orange",
+        },
+        "body": {"elements": elements},
     }
 
 
