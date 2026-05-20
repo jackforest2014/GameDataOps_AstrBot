@@ -153,3 +153,39 @@ class GameDataAIClient:
                     f"http={resp.status} feedback_id={payload.get('feedback_id')}"
                 )
                 return payload
+
+    async def poll_session_notifications(self, *, limit: int = 20) -> dict[str, Any]:
+        path = "/api/v1/session/notifications"
+        query = f"?limit={limit}"
+        headers = {
+            **build_identity_headers(
+                shared_secret=self.shared_secret,
+                feishu_user_id="_notify_poll",
+                feishu_chat_id="_notify_poll",
+                feishu_message_id=f"poll_{limit}",
+                method="GET",
+                path=path,
+                raw_body=b"",
+                service_token=self.service_token,
+            ),
+        }
+        url = f"{self.base_url}{path}{query}"
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                text = await resp.text()
+                try:
+                    payload = json.loads(text) if text else {}
+                except json.JSONDecodeError:
+                    payload = {"notifications": []}
+                if resp.status >= 400:
+                    logger.warning(
+                        f"[game_data_ai] api.poll_notifications http={resp.status} body={text[:200]}"
+                    )
+                    return {"notifications": []}
+                items = payload.get("notifications") or []
+                if items:
+                    logger.info(
+                        f"[game_data_ai] api.poll_notifications count={len(items)}"
+                    )
+                return payload

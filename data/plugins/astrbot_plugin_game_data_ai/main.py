@@ -8,6 +8,8 @@ game_data_ai 飞书问数插件（MVP batch 3: A01–A23）
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +36,7 @@ from game_data_ai.cards import (
 )
 from game_data_ai.card_action import register_feedback_card_handler
 from game_data_ai.client import GameDataAIClient
+from game_data_ai.session_notice import build_session_closed_card_json
 
 DATA_KEYWORDS = (
     "流水",
@@ -86,6 +89,13 @@ class GameDataAIPlugin(star.Star):
         super().__init__(context)
         self.client = GameDataAIClient()
         register_feedback_card_handler(self.client, self._send_card_from_action)
+        self._notify_stop = asyncio.Event()
+        self._notify_task: asyncio.Task | None = None
+        try:
+            loop = asyncio.get_running_loop()
+            self._notify_task = loop.create_task(self._session_notify_loop())
+        except RuntimeError:
+            pass
         logger.info("[game_data_ai] 已注册飞书卡片按钮回调 card.action.trigger")
 
     async def _send_card_from_action(self, _event, card_json: dict, chat_id: str) -> None:
@@ -96,7 +106,7 @@ class GameDataAIPlugin(star.Star):
             )
             from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
         except ImportError:
-            return
+            return False
         adapter = None
         for inst in self.context.platform_manager.get_insts():
             if isinstance(inst, LarkPlatformAdapter):
@@ -104,11 +114,11 @@ class GameDataAIPlugin(star.Star):
                 break
         if adapter is None:
             logger.warning("[game_data_ai] 未找到 Lark 适配器，追问卡片未发送")
-            return
+            return False
         lark_api = getattr(adapter, "lark_api", None)
         if lark_api is None:
             logger.warning("[game_data_ai] Lark API 客户端不可用")
-            return
+            return False
         try:
             ok = await LarkMessageEvent._send_interactive_card(
                 card_json,
@@ -121,11 +131,52 @@ class GameDataAIPlugin(star.Star):
                 logger.info(f"[game_data_ai] lark.correction_card_sent chat={chat_id}")
             else:
                 logger.warning("[game_data_ai] lark.correction_card_sent failed")
+            return ok
         except Exception as e:
             logger.warning(f"[game_data_ai] 追问卡片发送失败: {e}")
+            return False
 
     async def terminate(self) -> None:
-        pass
+        self._notify_stop.set()
+        if self._notify_task is not None:
+            self._notify_task.cancel()
+            try:
+                await self._notify_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _session_notify_loop(self) -> None:
+        interval = float(os.getenv("GAME_DATA_AI_NOTIFY_POLL_SEC", "5"))
+        if interval < 2:
+            interval = 2
+        logger.info(f"[game_data_ai] session.notify_poll started interval={interval}s")
+        while not self._notify_stop.is_set():
+            try:
+                payload = await self.client.poll_session_notifications(limit=20)
+                for item in payload.get("notifications") or []:
+                    chat_id = item.get("feishu_chat_id") or ""
+                    message = item.get("message") or ""
+                    idle_min = int(item.get("idle_minutes") or 1)
+                    if not chat_id or not message:
+                        continue
+                    card = build_session_closed_card_json(
+                        message=message,
+                        idle_minutes=idle_min,
+                    )
+                    ok = await self._send_card_from_action(None, card, chat_id)
+                    if ok:
+                        logger.info(
+                            f"[game_data_ai] lark.session_closed_notice chat={chat_id} "
+                            f"idle_min={idle_min}"
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[game_data_ai] session.notify_poll error: {e}")
+            try:
+                await asyncio.wait_for(self._notify_stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
 
     async def _try_send_lark_card(
         self,
