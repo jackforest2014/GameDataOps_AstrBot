@@ -319,6 +319,7 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     charts = answer.get("charts") or []
 
     summary = answer.get("summary", "")
+    sections = answer.get("sections") or []
     facts_md = "\n".join(f"• {f}" for f in facts[:5])
     trace_block = (
         f"**追溯信息**\n"
@@ -332,7 +333,23 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
         {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"},
     ]
 
-    if is_chart:
+    if sections:
+        for sec in sections:
+            label = sec.get("stage_label") or ""
+            title = sec.get("title") or label
+            sec_summary = sec.get("summary", "")
+            sec_facts = sec.get("facts") or []
+            block = f"**{label}** {title}\n{sec_summary}"
+            if sec_facts:
+                block += "\n" + "\n".join(f"• {f}" for f in sec_facts[:3])
+            elements.append({"tag": "markdown", "content": block})
+            sec_charts = sec.get("charts") or []
+            if is_chart and sec_charts:
+                elements.extend(build_charts_elements(sec_charts, max_charts=2))
+            elif sec.get("metrics"):
+                elements.extend(_metric_columns(sec.get("metrics") or [])[:2])
+
+    if is_chart and not sections:
         # 图表视图：优先 answer.charts[]（第六批），否则 chart_series 兼容
         if charts:
             elements.append(
