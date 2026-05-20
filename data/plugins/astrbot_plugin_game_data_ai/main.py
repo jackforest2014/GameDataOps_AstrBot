@@ -36,34 +36,12 @@ from game_data_ai.cards import (
 )
 from game_data_ai.card_action import register_feedback_card_handler
 from game_data_ai.client import GameDataAIClient
-from game_data_ai.session_notice import build_session_closed_card_json
-
-DATA_KEYWORDS = (
-    "流水",
-    "付费",
-    "活动",
-    "收入",
-    "营收",
-    "arppu",
-    "数据",
-    "分析",
-    "复盘",
-    "朱雀",
-    "仙魔",
-    "怎么样",
-    "看下",
-    "图形",
-    "图表",
-    "可视化",
-    "图形式",
+from game_data_ai.routing import detect_route, should_route_question
+from game_data_ai.schedule_cancel_card import (
+    build_cancel_preview_card,
+    build_schedule_created_card,
 )
-
-
-def _should_route_question(text: str) -> bool:
-    t = (text or "").strip()
-    if not t or t.startswith("/"):
-        return False
-    return any(k in t for k in DATA_KEYWORDS)
+from game_data_ai.session_notice import build_session_closed_card_json
 
 
 def _feishu_ids(event: AstrMessageEvent) -> tuple[str, str, str]:
@@ -88,12 +66,19 @@ class GameDataAIPlugin(star.Star):
     def __init__(self, context: star.Context) -> None:
         super().__init__(context)
         self.client = GameDataAIClient()
-        register_feedback_card_handler(self.client, self._send_card_from_action)
+        self._cancel_candidates: dict[str, list[str]] = {}
+        register_feedback_card_handler(
+            self.client,
+            self._send_card_from_action,
+            cancel_candidates=self._cancel_candidates,
+        )
         self._notify_stop = asyncio.Event()
         self._notify_task: asyncio.Task | None = None
+        self._delivery_task: asyncio.Task | None = None
         try:
             loop = asyncio.get_running_loop()
             self._notify_task = loop.create_task(self._session_notify_loop())
+            self._delivery_task = loop.create_task(self._delivery_poll_loop())
         except RuntimeError:
             pass
         logger.info("[game_data_ai] 已注册飞书卡片按钮回调 card.action.trigger")
@@ -138,12 +123,13 @@ class GameDataAIPlugin(star.Star):
 
     async def terminate(self) -> None:
         self._notify_stop.set()
-        if self._notify_task is not None:
-            self._notify_task.cancel()
-            try:
-                await self._notify_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._notify_task, self._delivery_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def _session_notify_loop(self) -> None:
         interval = float(os.getenv("GAME_DATA_AI_NOTIFY_POLL_SEC", "5"))
@@ -221,7 +207,7 @@ class GameDataAIPlugin(star.Star):
         text = (event.message_str or "").strip()
 
         if msg_type == MessageType.GROUP_MESSAGE:
-            if _should_route_question(text):
+            if should_route_question(text):
                 yield event.plain_result(build_p2p_only_plain())
                 event.stop_event()
             return
@@ -229,12 +215,98 @@ class GameDataAIPlugin(star.Star):
         if msg_type != MessageType.FRIEND_MESSAGE:
             return
 
-        if not _should_route_question(text):
+        if not should_route_question(text):
             return
 
-        async for result in self._handle_query(event, text):
-            yield result
+        route = detect_route(text)
+        if route == "cancel":
+            async for result in self._handle_cancel(event, text):
+                yield result
+        elif route == "schedule":
+            async for result in self._handle_schedule(event, text):
+                yield result
+        else:
+            async for result in self._handle_query(event, text):
+                yield result
         event.stop_event()
+
+    async def _delivery_poll_loop(self) -> None:
+        interval = float(os.getenv("GAME_DATA_AI_DELIVERY_POLL_SEC", "30"))
+        if interval < 10:
+            interval = 10
+        logger.info(f"[game_data_ai] delivery.poll started interval={interval}s")
+        while not self._notify_stop.is_set():
+            try:
+                payload = await self.client.poll_schedule_deliveries(pending=True)
+                for item in payload.get("deliveries") or []:
+                    chat_id = item.get("feishu_chat_id") or ""
+                    qpayload = item.get("payload") or {}
+                    if not chat_id or not qpayload:
+                        continue
+                    card = build_result_card_json(qpayload)
+                    header = card.get("header") or {}
+                    title = header.get("title") or {}
+                    title["content"] = "【定时洞察】" + (title.get("content") or "分析结果")
+                    header["template"] = "wathet"
+                    ok = await self._send_card_from_action(None, card, chat_id)
+                    if ok:
+                        await self.client.ack_delivery(int(item.get("id") or 0))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[game_data_ai] delivery.poll error: {e}")
+            try:
+                await asyncio.wait_for(self._notify_stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _handle_schedule(self, event: AstrMessageEvent, question: str):
+        user_id, chat_id, message_id = _feishu_ids(event)
+        yield event.plain_result("正在创建定时推送…")
+        try:
+            resp = await self.client.create_schedule(
+                feishu_user_id=user_id,
+                feishu_chat_id=chat_id,
+                feishu_message_id=message_id,
+                question=question,
+            )
+        except Exception as e:
+            yield event.plain_result(f"创建定时任务失败：{e}")
+            return
+        if resp.get("error"):
+            yield event.plain_result(str(resp.get("error")))
+            return
+        card = build_schedule_created_card(resp)
+        sent = await self._try_send_lark_card(event, card, chat_id, message_id)
+        if not sent:
+            yield event.plain_result(
+                f"已创建定时推送：{resp.get('label', '')}，下次 {resp.get('next_run_at', '')}"
+            )
+
+    async def _handle_cancel(self, event: AstrMessageEvent, question: str):
+        user_id, chat_id, message_id = _feishu_ids(event)
+        yield event.plain_result("正在加载可取消的定时任务…")
+        try:
+            preview = await self.client.cancel_preview(
+                feishu_user_id=user_id,
+                feishu_chat_id=chat_id,
+                feishu_message_id=message_id,
+                question=question,
+            )
+        except Exception as e:
+            yield event.plain_result(f"取消预览失败：{e}")
+            return
+        token = preview.get("action_token", "")
+        if token:
+            self._cancel_candidates[token] = [
+                it.get("schedule_id", "") for it in preview.get("items") or []
+            ]
+        card = build_cancel_preview_card(preview)
+        sent = await self._try_send_lark_card(event, card, chat_id, message_id)
+        if not sent:
+            items = preview.get("items") or []
+            lines = "\n".join(f"- {it.get('label', '')}" for it in items[:10])
+            yield event.plain_result(f"请选择要取消的任务（请在卡片中操作）：\n{lines}")
 
     async def _handle_query(self, event: AstrMessageEvent, question: str):
         user_id, chat_id, message_id = _feishu_ids(event)
