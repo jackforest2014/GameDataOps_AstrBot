@@ -8,6 +8,8 @@ from typing import Any
 
 from astrbot.api import logger
 
+from game_data_ai.charts import build_charts_elements
+
 
 _PROBLEM_TYPE_LABELS: dict[str, str] = {
     "metric_scope_wrong": "口径不对",
@@ -314,8 +316,10 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     facts = answer.get("facts") or []
     metrics = answer.get("metrics") or []
     chart_series = answer.get("chart_series") or []
+    charts = answer.get("charts") or []
 
     summary = answer.get("summary", "")
+    sections = answer.get("sections") or []
     facts_md = "\n".join(f"• {f}" for f in facts[:5])
     trace_block = (
         f"**追溯信息**\n"
@@ -329,9 +333,37 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
         {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"},
     ]
 
-    if is_chart:
-        # 图表视图：原生 chart（手机/PC 一致）+ 数字明细表
-        if chart_series:
+    if sections:
+        for sec in sections:
+            label = sec.get("stage_label") or ""
+            title = sec.get("title") or label
+            sec_summary = sec.get("summary", "")
+            sec_facts = sec.get("facts") or []
+            block = f"**{label}** {title}\n{sec_summary}"
+            if sec_facts:
+                block += "\n" + "\n".join(f"• {f}" for f in sec_facts[:3])
+            elements.append({"tag": "markdown", "content": block})
+            sec_charts = sec.get("charts") or []
+            if is_chart and sec_charts:
+                elements.extend(build_charts_elements(sec_charts, max_charts=2))
+            elif sec.get("metrics"):
+                elements.extend(_metric_columns(sec.get("metrics") or [])[:2])
+
+    if is_chart and not sections:
+        # 图表视图：优先 answer.charts[]（第六批），否则 chart_series 兼容
+        if charts:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": (
+                        "**数据图表**\n"
+                        "<font color='grey'>以下为平台 Catalog 渲染的 VChart 图表，"
+                        "可在手机端点击全屏查看。</font>"
+                    ),
+                }
+            )
+            elements.extend(build_charts_elements(charts))
+        elif chart_series:
             elements.append(
                 {
                     "tag": "markdown",
