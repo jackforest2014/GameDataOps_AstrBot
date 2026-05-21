@@ -57,6 +57,34 @@ class GameDataAIClient:
                     payload = {"error": {"code": f"http_{resp.status}", "message": text}}
                 return payload
 
+    async def classify_route(
+        self,
+        *,
+        feishu_user_id: str,
+        feishu_chat_id: str,
+        feishu_message_id: str,
+        question: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        path = "/api/v1/intent/route"
+        body_obj: dict[str, Any] = {"question": question}
+        if session_id:
+            body_obj["session_id"] = session_id
+        timeout = float(os.getenv("GAME_DATA_AI_ROUTE_TIMEOUT_SEC", "20"))
+        payload = await self._post_json(
+            path,
+            body_obj,
+            feishu_user_id=feishu_user_id,
+            feishu_chat_id=feishu_chat_id,
+            feishu_message_id=feishu_message_id,
+            timeout_sec=timeout,
+        )
+        logger.info(
+            f"[game_data_ai] route.classify route={payload.get('route')} "
+            f"source={payload.get('source')} reason={(payload.get('reason') or '')[:60]}"
+        )
+        return payload
+
     async def query_metric(
         self,
         *,
@@ -81,12 +109,14 @@ class GameDataAIClient:
             f"[game_data_ai] api.request POST {path} "
             f"user={feishu_user_id} msg={feishu_message_id} question={question[:80]}"
         )
+        timeout = float(os.getenv("GAME_DATA_AI_QUERY_TIMEOUT_SEC", "90"))
         payload = await self._post_json(
             path,
             body_obj,
             feishu_user_id=feishu_user_id,
             feishu_chat_id=feishu_chat_id,
             feishu_message_id=feishu_message_id,
+            timeout_sec=timeout,
         )
         answer = payload.get("answer") or {}
         rendering = payload.get("rendering") or {}

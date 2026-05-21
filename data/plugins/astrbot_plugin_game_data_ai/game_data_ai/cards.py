@@ -8,7 +8,12 @@ from typing import Any
 
 from astrbot.api import logger
 
-from game_data_ai.charts import build_charts_elements
+from game_data_ai.charts import (
+    annotate_first_chart_legend,
+    build_charts_elements,
+    is_week_compare_legend_chart,
+    panel_has_week_compare_legend,
+)
 
 
 _PROBLEM_TYPE_LABELS: dict[str, str] = {
@@ -197,6 +202,526 @@ def _chart_native_element(series: list[dict[str, Any]]) -> dict[str, Any] | None
     }
 
 
+def _daily_pay_table(rows: list[dict[str, Any]], *, title: str = "**每日明细**") -> str:
+    """多维每日付费明细（平台 answer.daily_rows）。"""
+    if not rows:
+        return ""
+    lines = [
+        title,
+        "<font color='grey'>金额：万元；付费率/溢价/留存：%；溢价=(付费笔数-人数)÷人数×100</font>",
+        "",
+        "| 日期 | 流水(万) | 人数 | 付费率 | ARPPU | ARPU | 付费次数溢价 | 付费留存 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for r in rows:
+        date = r.get("date", "")
+        rev = float(r.get("revenue_wan") or 0)
+        payers = r.get("payers")
+        pay_rate = r.get("pay_rate_pct")
+        arppu = r.get("arppu")
+        arpu = r.get("arpu")
+        rep = r.get("same_day_repurchase_pct")
+        ret = r.get("pay_retention_1d_pct")
+
+        def _cell(v: Any, fmt: str = "") -> str:
+            if v is None or v == "":
+                return "—"
+            if fmt:
+                return fmt.format(round(float(v), 2) if isinstance(v, (int, float)) else v)
+            return str(v)
+
+        lines.append(
+            "| {date} | **{rev:.2f}** | {payers} | {pr} | {arppu} | {arpu} | {rep} | {ret} |".format(
+                date=date,
+                rev=rev,
+                payers=_cell(payers, "{:.2f}"),
+                pr=_cell(pay_rate, "{:.2f}%"),
+                arppu=_cell(arppu, "{:.2f}"),
+                arpu=_cell(arpu, "{:.2f}"),
+                rep=_cell(rep, "{:.2f}%"),
+                ret=_cell(ret, "{:.2f}%"),
+            )
+        )
+    return "\n".join(lines)
+
+
+def _daily_pay_tables_by_period(rows: list[dict[str, Any]]) -> list[str]:
+    """按 PDF 示例拆 P1 / P2 两张日表。"""
+    p1 = [r for r in rows if r.get("period") in ("近一周", "P1")]
+    p2 = [r for r in rows if r.get("period") in ("前一周", "P2")]
+    blocks: list[str] = []
+    if p1:
+        blocks.append(_daily_pay_table(p1, title="**表1 · P1（近一周）每日明细**"))
+    if p2:
+        blocks.append(_daily_pay_table(p2, title="**表2 · P2（前一周）每日明细**"))
+    if not blocks and rows:
+        blocks.append(_daily_pay_table(rows))
+    return blocks
+
+
+def _is_pay_weekly_sections(sections: list[dict[str, Any]]) -> bool:
+    return any(
+        s.get("stage_index") == 2 and "周维度" in (s.get("title") or "")
+        for s in sections
+    )
+
+
+# 单张飞书卡片内 VChart 过多易触发 2200；超出时拆为多张卡片（关系紧密的内容仍同卡）
+MAX_CHARTS_PER_CARD = 4
+
+
+def _count_chart_elements(elements: list[dict[str, Any]]) -> int:
+    return sum(1 for e in elements if e.get("tag") == "chart")
+
+
+def _is_metric_subplot_title(el: dict[str, Any]) -> bool:
+    if el.get("tag") != "markdown":
+        return False
+    content = (el.get("content") or "").strip()
+    return (
+        content.startswith("**")
+        and content.endswith("**")
+        and content.count("**") == 2
+        and "\n" not in content[2:-2]
+    )
+
+
+def _split_week_compare_panel_elements(
+    panel_elements: list[dict[str, Any]], *, max_charts: int = MAX_CHARTS_PER_CARD
+) -> list[list[dict[str, Any]]]:
+    """按「指标标题 markdown + 子图 chart」原子单元分包，避免 ARPU 等标题与图跨卡。"""
+    preamble: list[dict[str, Any]] = []
+    units: list[list[dict[str, Any]]] = []
+    i = 0
+    while i < len(panel_elements):
+        el = panel_elements[i]
+        if (
+            _is_metric_subplot_title(el)
+            and i + 1 < len(panel_elements)
+            and panel_elements[i + 1].get("tag") == "chart"
+        ):
+            units.append([el, panel_elements[i + 1]])
+            i += 2
+            continue
+        if is_week_compare_legend_chart(el):
+            preamble.append(el)
+            i += 1
+            continue
+        if el.get("tag") == "chart":
+            units.append([el])
+            i += 1
+            continue
+        preamble.append(el)
+        i += 1
+
+    if not units:
+        return [panel_elements]
+
+    has_legend = panel_has_week_compare_legend(panel_elements)
+    chunks: list[list[dict[str, Any]]] = []
+    batch: list[list[dict[str, Any]]] = []
+    for unit in units:
+        preamble_charts = sum(1 for e in preamble if e.get("tag") == "chart")
+        if not preamble and has_legend and chunks:
+            # 续卡 annotate 会插入图例，预留 1 个 chart 位
+            preamble_charts = 1
+        if len(batch) >= max_charts - preamble_charts:
+            chunk = preamble + [e for u in batch for e in u]
+            annotate_first_chart_legend(chunk)
+            chunks.append(chunk)
+            preamble = []
+            batch = []
+        batch.append(unit)
+    if batch:
+        chunk = preamble + [e for u in batch for e in u]
+        annotate_first_chart_legend(chunk)
+        chunks.append(chunk)
+    return chunks if chunks else [panel_elements]
+
+
+def _make_feishu_card(
+    *,
+    title: str,
+    subtitle: str,
+    elements: list[dict[str, Any]],
+    template: str = "blue",
+) -> dict[str, Any]:
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "subtitle": {"tag": "plain_text", "content": subtitle},
+            "template": template,
+        },
+        "body": {"elements": elements},
+    }
+
+
+def _chart_caption_md(spec: dict[str, Any]) -> str:
+    """仅补充非图例说明（折线图图例由 VChart legends 渲染）。"""
+    if spec.get("type") == "line" and spec.get("series_field"):
+        return "<font color='grey'>横轴 D1–D7 表示当周内第 N 天</font>"
+    return ""
+
+
+def _week_compare_table_md(
+    metrics: list[dict[str, Any]],
+    *,
+    compare_rows: list[dict[str, Any]] | None = None,
+    chart_rows: list[dict[str, Any]] | None = None,
+) -> str:
+    """表3 周维度对比（7 项指标：P1 / P2 / 环比）。"""
+    rows: list[tuple[str, str, str, str]] = []
+    if compare_rows:
+        for r in compare_rows:
+            rows.append(
+                (
+                    str(r.get("metric") or ""),
+                    str(r.get("p1") or ""),
+                    str(r.get("p2") or ""),
+                    str(r.get("delta") or ""),
+                )
+            )
+    elif chart_rows:
+        grouped: dict[str, dict[str, float]] = {}
+        for r in chart_rows:
+            metric = str(r.get("metric") or "")
+            period = str(r.get("period") or "")
+            if metric:
+                grouped.setdefault(metric, {})[period] = float(r.get("value") or 0)
+        for metric, vals in grouped.items():
+            p1 = vals.get("近一周", 0)
+            p2 = vals.get("前一周", 0)
+            delta = ""
+            if p2:
+                delta = f"{(p1 - p2) / p2 * 100:+.1f}%"
+            rows.append(
+                (
+                    metric,
+                    f"{p1:.2f}",
+                    f"{p2:.2f}",
+                    delta,
+                )
+            )
+    elif len(metrics) >= 4:
+        rows = [
+            ("流水", str(metrics[0].get("value", "")), str(metrics[1].get("value", "")), str(metrics[0].get("delta") or "")),
+            ("付费人数", str(metrics[2].get("value", "")), str(metrics[3].get("value", "")), str(metrics[2].get("delta") or "")),
+        ]
+    if not rows:
+        return ""
+    lines = [
+        "**表3 · 周维度对比**",
+        "",
+        "| 指标 | 近一周(P1) | 前一周(P2) |",
+        "| --- | ---: | ---: |",
+    ]
+    for metric, p1, p2, delta in rows:
+        d1s = f" ({delta})" if delta else ""
+        lines.append(f"| {metric} | **{p1}**{d1s} | {p2} |")
+    return "\n".join(lines)
+
+
+def _append_section_charts(
+    elements: list[dict[str, Any]],
+    charts: list[dict[str, Any]],
+    *,
+    trace_id: str = "",
+    used_chart_ids: set[str] | None = None,
+) -> None:
+    seen = used_chart_ids if used_chart_ids is not None else set()
+    for spec in charts:
+        cap = _chart_caption_md(spec)
+        if cap:
+            elements.append({"tag": "markdown", "content": cap})
+        elements.extend(
+            build_charts_elements([spec], trace_id=trace_id, used_ids=seen)
+        )
+
+
+def _append_card_footer(
+    elements: list[dict[str, Any]],
+    payload: dict[str, Any],
+    *,
+    with_feedback: bool = True,
+) -> None:
+    answer = payload.get("answer") or {}
+    trace_id = payload.get("trace_id", "")
+    session_id = payload.get("session_id", "")
+    template_id = answer.get("template_id", "")
+    trace_block = (
+        f"**追溯信息**\n"
+        f"trace `{trace_id}` · 模板 `{template_id}`\n"
+        f"口径 {answer.get('methodology', '')}\n"
+        f"SQL digest `{answer.get('sql_digest', '')}`"
+    )
+    rag_md = _lineage_rag_block(answer.get("rag_citations") or [])
+    if rag_md:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": rag_md})
+    exp_md = _lineage_experience_block(answer.get("experience_reuse"))
+    if exp_md:
+        elements.append({"tag": "markdown", "content": exp_md})
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": trace_block})
+    if not with_feedback:
+        return
+    elements.append(
+        {
+            "tag": "markdown",
+            "content": (
+                "<font color='grey'>反馈与沉淀为独立动作：可先点「有用」，"
+                "再点「沉淀模板候选」。</font>"
+            ),
+        }
+    )
+    buttons = [
+        _feedback_button("有用", "good_case", trace_id, session_id, template_id, primary=True),
+        _feedback_button("有问题", "bad_case", trace_id, session_id, template_id),
+        _feedback_button(
+            "沉淀模板候选", "sql_template_candidate", trace_id, session_id, template_id
+        ),
+    ]
+    elements.append(
+        {
+            "tag": "column_set",
+            "flex_mode": "trisect",
+            "horizontal_spacing": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [buttons[0]],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [buttons[1]],
+                },
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [buttons[2]],
+                },
+            ],
+        }
+    )
+
+
+def _section_header_md(sec: dict[str, Any]) -> str:
+    label = sec.get("stage_label") or ""
+    title = sec.get("title") or label
+    header = f"**{label}** {title}"
+    if sec.get("summary"):
+        header += f"\n{sec['summary']}"
+    return header
+
+
+def _build_pay_weekly_sec1_elements(
+    sec: dict[str, Any],
+    *,
+    daily_rows: list[dict[str, Any]],
+    trace_id: str,
+    used_chart_ids: set[str],
+) -> list[dict[str, Any]]:
+    elements: list[dict[str, Any]] = []
+    elements.append({"tag": "markdown", "content": _section_header_md(sec)})
+    p1_rows = [r for r in daily_rows if r.get("period") in ("近一周", "P1")]
+    p2_rows = [r for r in daily_rows if r.get("period") in ("前一周", "P2")]
+    if p1_rows:
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": _daily_pay_table(p1_rows, title="**表1 · P1（近一周）每日明细**"),
+            }
+        )
+    if p2_rows:
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": _daily_pay_table(p2_rows, title="**表2 · P2（前一周）每日明细**"),
+            }
+        )
+    for fact in sec.get("facts") or []:
+        elements.append({"tag": "markdown", "content": f"<font color='grey'>{fact}</font>"})
+    _append_section_charts(
+        elements, sec.get("charts") or [], trace_id=trace_id, used_chart_ids=used_chart_ids
+    )
+    return elements
+
+
+def _build_pay_weekly_sec2_element_groups(
+    sec: dict[str, Any],
+    *,
+    metrics: list[dict[str, Any]],
+    trace_id: str,
+    used_chart_ids: set[str],
+) -> list[list[dict[str, Any]]]:
+    """表3 + 周对比子图；图表超限时拆成多段元素列表（可对应多张卡片）。"""
+    prefix: list[dict[str, Any]] = [
+        {"tag": "markdown", "content": _section_header_md(sec)},
+    ]
+    chart_rows: list[dict[str, Any]] = []
+    panel_spec: dict[str, Any] | None = None
+    for ch in sec.get("charts") or []:
+        if ch.get("chart_id") == "wk_cmp_panel":
+            chart_rows = ch.get("data_rows") or []
+            panel_spec = ch
+            break
+    tbl = _week_compare_table_md(
+        sec.get("metrics") or metrics,
+        compare_rows=sec.get("compare_rows"),
+        chart_rows=chart_rows,
+    )
+    if tbl:
+        prefix.append({"tag": "markdown", "content": tbl})
+    elif sec.get("facts"):
+        prefix.append(
+            {
+                "tag": "markdown",
+                "content": "\n".join(f"• {f}" for f in (sec.get("facts") or [])[:4]),
+            }
+        )
+    if not panel_spec:
+        return [prefix]
+
+    chart_parts: list[dict[str, Any]] = []
+    _append_section_charts(
+        chart_parts, [panel_spec], trace_id=trace_id, used_chart_ids=used_chart_ids
+    )
+    panel_chunks = _split_week_compare_panel_elements(chart_parts)
+    if len(panel_chunks) <= 1:
+        annotate_first_chart_legend(panel_chunks[0])
+        return [prefix + panel_chunks[0]]
+    out: list[list[dict[str, Any]]] = []
+    total = len(panel_chunks)
+    for i, chunk in enumerate(panel_chunks):
+        if i == 0:
+            out.append(prefix + chunk)
+            continue
+        cont: list[dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**{sec.get('title') or '表3'}（续 {i + 1}/{total}）**\n"
+                    "<font color='grey'>周对比子图（接上一卡）</font>"
+                ),
+            }
+        ]
+        cont.extend(chunk)
+        annotate_first_chart_legend(cont)
+        out.append(cont)
+    return out
+
+
+def _build_pay_weekly_sec3_elements(sec: dict[str, Any]) -> list[dict[str, Any]]:
+    header = _section_header_md(sec)
+    if sec.get("facts"):
+        header += "\n" + "\n".join(f"• {f}" for f in sec.get("facts")[:6])
+    return [{"tag": "markdown", "content": header}]
+
+
+def build_pay_weekly_cards_json(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """双周付费分析拆为多张飞书卡片，避免单卡 VChart 过多导致 2200。"""
+    answer = payload.get("answer") or {}
+    sections = answer.get("sections") or []
+    summary = answer.get("summary", "")
+    daily_rows = answer.get("daily_rows") or []
+    metrics = answer.get("metrics") or []
+    base_title = answer.get("title", "分析结果")
+    used_chart_ids: set[str] = set()
+    trace_id = payload.get("trace_id", "")
+
+    card_bodies: list[tuple[str, list[dict[str, Any]], str]] = []
+
+    sec1 = next((s for s in sections if s.get("stage_index") == 1), None)
+    sec2 = next((s for s in sections if s.get("stage_index") == 2), None)
+    sec3 = next((s for s in sections if s.get("stage_index") == 3), None)
+
+    if sec1:
+        el1: list[dict[str, Any]] = [
+            {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"},
+        ]
+        el1.extend(
+            _build_pay_weekly_sec1_elements(
+                sec1, daily_rows=daily_rows, trace_id=trace_id, used_chart_ids=used_chart_ids
+            )
+        )
+        card_bodies.append(("每日明细 · 表1/表2 · 日流水与趋势图", el1, "blue"))
+
+    if sec2:
+        for group in _build_pay_weekly_sec2_element_groups(
+            sec2, metrics=metrics, trace_id=trace_id, used_chart_ids=used_chart_ids
+        ):
+            n = _count_chart_elements(group)
+            sub = f"周维度对比 · 表3" + (f" · {n} 图" if n else "")
+            card_bodies.append((sub, group, "blue"))
+
+    if sec3:
+        el3 = _build_pay_weekly_sec3_elements(sec3)
+        _append_card_footer(el3, payload, with_feedback=True)
+        card_bodies.append(("结论与追溯反馈", el3, "green"))
+
+    total = len(card_bodies)
+    cards: list[dict[str, Any]] = []
+    for i, (subtitle, elements, template) in enumerate(card_bodies, start=1):
+        part_title = base_title if total == 1 else f"{base_title}（{i}/{total}）"
+        part_sub = subtitle if total == 1 else f"{i}/{total} · {subtitle}"
+        cards.append(
+            _make_feishu_card(
+                title=part_title,
+                subtitle=part_sub,
+                elements=elements,
+                template=template,
+            )
+        )
+        log_card_build(payload, cards[-1], part=i, parts=total)
+    return cards
+
+
+def build_result_cards_json(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    answer = payload.get("answer") or {}
+    sections = answer.get("sections") or []
+    if sections and _is_pay_weekly_sections(sections):
+        return build_pay_weekly_cards_json(payload)
+    return [build_result_card_json(payload)]
+
+
+def _append_chart_blocks(
+    elements: list[dict[str, Any]],
+    charts: list[dict[str, Any]],
+    *,
+    max_charts: int = 3,
+    heading: str = "**数据图表**",
+    trace_id: str = "",
+    used_chart_ids: set[str] | None = None,
+) -> None:
+    if not charts:
+        return
+    elements.append(
+        {
+            "tag": "markdown",
+            "content": (
+                f"{heading}\n"
+                "<font color='grey'>趋势/对比图可在手机端点击全屏查看；"
+                "与上方表格为同一数据源。</font>"
+            ),
+        }
+    )
+    elements.extend(
+        build_charts_elements(
+            charts,
+            max_charts=max_charts,
+            trace_id=trace_id,
+            used_ids=used_chart_ids,
+        )
+    )
+
+
 def _chart_series_data_table(series: list[dict[str, Any]]) -> str:
     """纯数字明细表（无 Unicode 横条，避免手机端表格渲染异常）。"""
     if not series:
@@ -280,12 +805,20 @@ def _lineage_experience_block(exp: dict[str, Any] | None) -> str:
     )
 
 
-def log_card_build(payload: dict[str, Any], card: dict[str, Any]) -> None:
+def log_card_build(
+    payload: dict[str, Any],
+    card: dict[str, Any],
+    *,
+    part: int = 1,
+    parts: int = 1,
+) -> None:
     answer = payload.get("answer") or {}
     rendering = payload.get("rendering") or {}
     header = card.get("header") or {}
     body = card.get("body") or {}
     elements = body.get("elements") or []
+    ncharts = _count_chart_elements(elements)
+    part_s = f" part={part}/{parts}" if parts > 1 else ""
     logger.info(
         "[game_data_ai] card.build "
         f"trace={payload.get('trace_id')} "
@@ -293,7 +826,7 @@ def log_card_build(payload: dict[str, Any], card: dict[str, Any]) -> None:
         f"title={answer.get('title', '')} "
         f"metrics={len(answer.get('metrics') or [])} "
         f"chart_points={len(answer.get('chart_series') or [])} "
-        f"elements={len(elements)} "
+        f"elements={len(elements)} charts={ncharts}{part_s} "
         f"header_template={header.get('template', 'blue')}"
     )
     logger.info(
@@ -316,6 +849,7 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     facts = answer.get("facts") or []
     metrics = answer.get("metrics") or []
     chart_series = answer.get("chart_series") or []
+    daily_rows = answer.get("daily_rows") or []
     charts = answer.get("charts") or []
 
     summary = answer.get("summary", "")
@@ -329,11 +863,13 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     is_chart = preferred == "chart"
-    elements: list[dict[str, Any]] = [
-        {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"},
-    ]
+    used_chart_element_ids: set[str] = set()
+    elements: list[dict[str, Any]] = []
 
     if sections:
+        elements.append(
+            {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"}
+        )
         for sec in sections:
             label = sec.get("stage_label") or ""
             title = sec.get("title") or label
@@ -344,13 +880,19 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
                 block += "\n" + "\n".join(f"• {f}" for f in sec_facts[:3])
             elements.append({"tag": "markdown", "content": block})
             sec_charts = sec.get("charts") or []
-            if is_chart and sec_charts:
-                elements.extend(build_charts_elements(sec_charts, max_charts=2))
+            if sec_charts:
+                _append_section_charts(
+                    elements,
+                    sec_charts,
+                    trace_id=trace_id,
+                    used_chart_ids=used_chart_element_ids,
+                )
             elif sec.get("metrics"):
-                elements.extend(_metric_columns(sec.get("metrics") or [])[:2])
-
-    if is_chart and not sections:
-        # 图表视图：优先 answer.charts[]（第六批），否则 chart_series 兼容
+                elements.extend(_metric_columns(sec.get("metrics") or [])[:4])
+    elif is_chart:
+        elements.append(
+            {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"}
+        )
         if charts:
             elements.append(
                 {
@@ -362,7 +904,9 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
                     ),
                 }
             )
-            elements.extend(build_charts_elements(charts))
+            elements.extend(
+                build_charts_elements(charts, trace_id=trace_id, used_ids=used_chart_element_ids)
+            )
         elif chart_series:
             elements.append(
                 {
@@ -380,77 +924,45 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
             elements.append(
                 {"tag": "markdown", "content": _chart_series_data_table(chart_series)}
             )
-        compact = metrics[:2]
-        elements.extend(_metric_columns(compact))
+        elements.extend(_metric_columns(metrics[:2]))
         if facts_md:
             elements.append(
-                {
-                    "tag": "markdown",
-                    "content": f"**结论摘要**\n{facts_md}",
-                }
+                {"tag": "markdown", "content": f"**结论摘要**\n{facts_md}"}
             )
     else:
-        # 表格视图：完整 KPI 格 + 关键事实，不展示易误解的条形图
+        elements.append(
+            {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"}
+        )
+        # 表格视图（无 sections）：KPI + 日表 + 图表
         elements.extend(_metric_columns(metrics))
+        period_tables = _daily_pay_tables_by_period(daily_rows)
+        if period_tables:
+            for tbl in period_tables:
+                elements.append({"tag": "markdown", "content": tbl})
+        elif chart_series:
+            elements.append(
+                {"tag": "markdown", "content": _chart_series_data_table(chart_series)}
+            )
+        else:
+            daily_md = _daily_pay_table(daily_rows)
+            if daily_md:
+                elements.append({"tag": "markdown", "content": daily_md})
+        if charts:
+            _append_chart_blocks(
+                elements,
+                charts,
+                max_charts=6,
+                trace_id=trace_id,
+                used_chart_ids=used_chart_element_ids,
+            )
         if facts_md:
-            elements.append({"tag": "markdown", "content": f"**关键事实**\n{facts_md}"})
+            label = "**Phase 2 · 结论摘要**" if sections else "**关键事实**"
+            elements.append({"tag": "markdown", "content": f"{label}\n{facts_md}"})
         hint = _table_mode_hint(chart_series)
-        if hint:
+        if hint and not daily_rows and not charts:
             elements.append({"tag": "markdown", "content": hint})
 
-    rag_md = _lineage_rag_block(answer.get("rag_citations") or [])
-    if rag_md:
-        elements.append({"tag": "hr"})
-        elements.append({"tag": "markdown", "content": rag_md})
-    exp_md = _lineage_experience_block(answer.get("experience_reuse"))
-    if exp_md:
-        elements.append({"tag": "markdown", "content": exp_md})
-    elements.append({"tag": "hr"})
-    elements.append({"tag": "markdown", "content": trace_block})
-    elements.append(
-        {
-            "tag": "markdown",
-            "content": (
-                "<font color='grey'>反馈与沉淀为独立动作：可先点「有用」，"
-                "再点「沉淀模板候选」。</font>"
-            ),
-        }
-    )
-
-    buttons = [
-        _feedback_button("有用", "good_case", trace_id, session_id, template_id, primary=True),
-        _feedback_button("有问题", "bad_case", trace_id, session_id, template_id),
-        _feedback_button(
-            "沉淀模板候选", "sql_template_candidate", trace_id, session_id, template_id
-        ),
-    ]
-    elements.append(
-        {
-            "tag": "column_set",
-            "flex_mode": "trisect",
-            "horizontal_spacing": "default",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [buttons[0]],
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [buttons[1]],
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [buttons[2]],
-                },
-            ],
-        }
-    )
+    _append_card_footer(elements, payload, with_feedback=True)
 
     card = {
         "schema": "2.0",
@@ -465,7 +977,7 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "body": {"elements": elements},
     }
-    log_card_build(payload, card)
+    log_card_build(payload, card, part=1, parts=1)
     return card
 
 

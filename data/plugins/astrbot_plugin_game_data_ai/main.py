@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 
 # AstrBot 以模块方式加载 main.py，需把插件根目录加入 path 才能 import 子包 game_data_ai
@@ -36,7 +37,8 @@ from game_data_ai.cards import (
 )
 from game_data_ai.card_action import register_feedback_card_handler
 from game_data_ai.client import GameDataAIClient
-from game_data_ai.routing import detect_route, should_route_question
+from game_data_ai.routing import detect_route
+from game_data_ai.routing_resolve import resolve_route
 from game_data_ai.schedule_cancel_card import (
     build_cancel_preview_card,
     build_schedule_created_card,
@@ -67,6 +69,8 @@ class GameDataAIPlugin(star.Star):
         super().__init__(context)
         self.client = GameDataAIClient()
         self._cancel_candidates: dict[str, list[str]] = {}
+        # chat_id -> unix time of last successful query (for date follow-ups)
+        self._active_data_chats: dict[str, float] = {}
         register_feedback_card_handler(
             self.client,
             self._send_card_from_action,
@@ -206,8 +210,18 @@ class GameDataAIPlugin(star.Star):
         msg_type = event.message_obj.type
         text = (event.message_str or "").strip()
 
+        user_id, chat_id, message_id = _feishu_ids(event)
+
         if msg_type == MessageType.GROUP_MESSAGE:
-            if should_route_question(text):
+            route = await resolve_route(
+                self.client,
+                text,
+                user_id=user_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                active_data_chats=self._active_data_chats,
+            )
+            if route not in ("ignore", ""):
                 yield event.plain_result(build_p2p_only_plain())
                 event.stop_event()
             return
@@ -215,10 +229,16 @@ class GameDataAIPlugin(star.Star):
         if msg_type != MessageType.FRIEND_MESSAGE:
             return
 
-        if not should_route_question(text):
+        route = await resolve_route(
+            self.client,
+            text,
+            user_id=user_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            active_data_chats=self._active_data_chats,
+        )
+        if route in ("ignore", ""):
             return
-
-        route = detect_route(text)
         if route == "cancel":
             async for result in self._handle_cancel(event, text):
                 yield result
@@ -340,16 +360,33 @@ class GameDataAIPlugin(star.Star):
                 return
 
         if status == "answered":
-            card = build_result_card_json(payload)
+            self._active_data_chats[chat_id] = time.time()
+            from game_data_ai.cards import build_result_cards_json
+
+            cards = build_result_cards_json(payload)
             logger.info(
-                f"[game_data_ai] lark.send_card chat={chat_id} "
+                f"[game_data_ai] lark.send_cards chat={chat_id} "
                 f"trace={payload.get('trace_id')} "
+                f"count={len(cards)} "
                 f"mode={(payload.get('rendering') or {}).get('preferred')}"
             )
-            sent_card = await self._try_send_lark_card(event, card, chat_id, message_id)
-            if sent_card:
-                logger.info("[game_data_ai] lark.card_sent ok")
-            else:
+            sent_card = False
+            for i, card in enumerate(cards):
+                ok = await self._try_send_lark_card(event, card, chat_id, message_id)
+                sent_card = sent_card or ok
+                if ok:
+                    logger.info(
+                        f"[game_data_ai] lark.card_sent ok {i + 1}/{len(cards)}"
+                    )
+                else:
+                    logger.warning(
+                        f"[game_data_ai] lark.card_sent failed {i + 1}/{len(cards)}"
+                    )
+                if i + 1 < len(cards):
+                    await asyncio.sleep(0.35)
+            if sent_card and len(cards) > 1:
+                logger.info(f"[game_data_ai] lark.cards_all_sent n={len(cards)}")
+            elif not sent_card:
                 logger.warning("[game_data_ai] lark.card_sent failed, fallback text")
             answer = payload.get("answer") or {}
             if not sent_card:
