@@ -1,7 +1,8 @@
 """
-game_data_ai 飞书问数插件（MVP batch 3: A01–A23）
+game_data_ai 飞书问数插件（MVP batch 3 + v1.1 文档）
 
-- p2p 消息 → POST /api/v1/query/metric
+- p2p 消息 → POST /api/v1/chat/messages（+ GET /api/v1/events/stream）
+- 带飞书文档链接 → 入库确认卡 + ingest-decision，最终答案走 SSE
 - 群聊 → p2p_only 提示
 - 结果 → 飞书交互卡片（lark Json）或纯文本降级
 """
@@ -35,8 +36,11 @@ from game_data_ai.cards import (
     build_result_card_json,
     card_json_to_plain_fallback,
 )
+from game_data_ai.attachments import build_attachments
 from game_data_ai.card_action import register_feedback_card_handler
 from game_data_ai.client import GameDataAIClient
+from game_data_ai.event_stream import DocumentSSEHub
+from game_data_ai.ingest_card import build_ingest_confirm_card
 from game_data_ai.routing import detect_route
 from game_data_ai.routing_resolve import resolve_route
 from game_data_ai.schedule_cancel_card import (
@@ -68,9 +72,16 @@ class GameDataAIPlugin(star.Star):
     def __init__(self, context: star.Context) -> None:
         super().__init__(context)
         self.client = GameDataAIClient()
+        self.sse_hub = DocumentSSEHub(self.client)
+        self.sse_hub.on_event(self._on_document_sse)
         self._cancel_candidates: dict[str, list[str]] = {}
         # chat_id -> unix time of last successful query (for date follow-ups)
         self._active_data_chats: dict[str, float] = {}
+        # trace_id -> {chat_id, message_id, confirm_shown}
+        self._doc_sessions: dict[str, dict] = {}
+        self._user_active_trace: dict[str, str] = {}
+        self._user_last_chat: dict[str, str] = {}
+        self._ingest_cards_sent: dict[str, set[str]] = {}
         register_feedback_card_handler(
             self.client,
             self._send_card_from_action,
@@ -127,6 +138,7 @@ class GameDataAIPlugin(star.Star):
 
     async def terminate(self) -> None:
         self._notify_stop.set()
+        await self.sse_hub.shutdown()
         for task in (self._notify_task, self._delivery_task):
             if task is not None:
                 task.cancel()
@@ -328,22 +340,165 @@ class GameDataAIPlugin(star.Star):
             lines = "\n".join(f"- {it.get('label', '')}" for it in items[:10])
             yield event.plain_result(f"请选择要取消的任务（请在卡片中操作）：\n{lines}")
 
+    async def _on_document_sse(
+        self,
+        feishu_user_id: str,
+        _ev_id: int,
+        event_type: str,
+        data: dict,
+    ) -> None:
+        if event_type == "document.ingest.confirm_required":
+            trace_id = self._user_active_trace.get(feishu_user_id, "")
+            if not trace_id:
+                return
+            sess = self._doc_sessions.get(trace_id)
+            if not sess:
+                return
+            doc_id = str(data.get("document_id") or "")
+            shown = self._ingest_cards_sent.setdefault(trace_id, set())
+            if doc_id in shown:
+                return
+            shown.add(doc_id)
+            card = build_ingest_confirm_card(
+                document_id=doc_id,
+                title=str(data.get("title") or ""),
+                trace_id=trace_id,
+            )
+            await self._send_card_from_action(None, card, sess["chat_id"])
+            return
+
+        if event_type == "document.auth_required":
+            auth_url = self.client.abs_url(str(data.get("auth_url") or ""))
+            chat_id = self._user_last_chat.get(feishu_user_id, feishu_user_id)
+            await self._send_card_from_action(
+                None,
+                {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "template": "orange",
+                        "title": {"tag": "plain_text", "content": "需要飞书授权"},
+                    },
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": (
+                                "访问该文档需要你的飞书账号授权。\n"
+                                f"请在浏览器打开并完成授权：\n{auth_url}\n\n"
+                                "完成后回到本对话重新发送文档链接。"
+                            ),
+                        }
+                    ],
+                },
+                chat_id,
+            )
+
+        if event_type == "document.ingest.progress":
+            pct = data.get("percent")
+            logger.info(
+                f"[game_data_ai] ingest.progress user={feishu_user_id[:16]} "
+                f"doc={data.get('document_id')} {pct}% stage={data.get('stage')}"
+            )
+
+    def _payload_from_sse_answered(self, data: dict) -> dict:
+        return {
+            "trace_id": data.get("trace_id"),
+            "session_id": data.get("session_id"),
+            "status": data.get("status") or "answered",
+            "answer": data.get("answer"),
+            "error": data.get("error"),
+            "rendering": data.get("rendering"),
+        }
+
+    async def _deliver_query_payload(
+        self,
+        event: AstrMessageEvent | None,
+        chat_id: str,
+        message_id: str,
+        payload: dict,
+    ) -> list:
+        """Send result cards/plain; returns yielded plain fragments if any."""
+        status = payload.get("status")
+        if status == "failed":
+            err = payload.get("error") or {}
+            if err.get("code") == "audit_write_failed":
+                return [
+                    "分析结果暂未下发（审计写入失败），请稍后重试或联系管理员。"
+                ]
+            if err.get("code") == "document_auth_required":
+                auth_url = self.client.abs_url(
+                    f"/api/v1/auth/feishu/start?feishu_user_id="
+                    f"{payload.get('feishu_user_id', '')}"
+                )
+                return [
+                    "需要飞书文档授权后才能继续。\n"
+                    f"请打开：{auth_url}\n授权后重新发送文档链接。"
+                ]
+            return [build_denied_plain(err) if err else str(err)]
+
+        if status == "denied":
+            err = payload.get("error") or {}
+            out = [build_denied_plain(err)]
+            if err.get("code") == "project_unresolved":
+                out.append("请补充项目名后重试，例如：「仙魔项目活动流水怎么样？」")
+            return out
+
+        if status != "answered":
+            err = payload.get("error") or {}
+            return [
+                build_denied_plain(err)
+                if err
+                else card_json_to_plain_fallback(payload)
+            ]
+
+        self._active_data_chats[chat_id] = time.time()
+        from game_data_ai.cards import build_result_cards_json
+
+        cards = build_result_cards_json(payload)
+        logger.info(
+            f"[game_data_ai] lark.send_cards chat={chat_id} "
+            f"trace={payload.get('trace_id')} count={len(cards)}"
+        )
+        sent_card = False
+        for i, card in enumerate(cards):
+            ok = False
+            if event is not None:
+                ok = await self._try_send_lark_card(event, card, chat_id, message_id)
+            if not ok:
+                ok = await self._send_card_from_action(None, card, chat_id)
+            sent_card = sent_card or ok
+            if i + 1 < len(cards):
+                await asyncio.sleep(0.35)
+        if sent_card:
+            return []
+        answer = payload.get("answer") or {}
+        return [
+            f"【{answer.get('title', '分析结果')}】\n"
+            f"{answer.get('summary', '')}\n"
+            + "\n".join(f"- {f}" for f in (answer.get("facts") or [])[:5])
+            + f"\n\ntrace: {payload.get('trace_id', '')}"
+        ]
+
     async def _handle_query(self, event: AstrMessageEvent, question: str):
         user_id, chat_id, message_id = _feishu_ids(event)
         if not user_id or not message_id:
             yield event.plain_result("无法识别飞书用户或消息 ID，请重试。")
             return
 
+        self._user_last_chat[user_id] = chat_id
+        self.sse_hub.ensure_connected(user_id)
+        attachments = build_attachments(question)
+
         yield event.plain_result(build_progress_plain())
 
         try:
-            payload = await self.client.query_metric(
+            payload = await self.client.chat_messages(
                 feishu_user_id=user_id,
                 feishu_chat_id=chat_id,
                 feishu_message_id=message_id,
                 question=question,
                 chat_type="p2p",
                 session_id=f"sess_{chat_id}",
+                attachments=attachments or None,
             )
         except Exception as e:
             logger.error(f"[game_data_ai] API 调用失败: {e}")
@@ -351,65 +506,58 @@ class GameDataAIPlugin(star.Star):
             return
 
         status = payload.get("status")
+        trace_id = str(payload.get("trace_id") or "")
+
         if status == "failed":
             err = payload.get("error") or {}
-            if err.get("code") == "audit_write_failed":
+            if err.get("code") == "document_auth_required":
+                auth_url = self.client.abs_url(
+                    f"/api/v1/auth/feishu/start?feishu_user_id={user_id}"
+                )
                 yield event.plain_result(
-                    "分析结果暂未下发（审计写入失败），请稍后重试或联系管理员。"
+                    "需要飞书文档授权。\n"
+                    f"请打开：{auth_url}\n完成后重新发送文档链接。"
                 )
                 return
+            for line in await self._deliver_query_payload(
+                event, chat_id, message_id, payload
+            ):
+                yield event.plain_result(line)
+            return
 
-        if status == "answered":
-            self._active_data_chats[chat_id] = time.time()
-            from game_data_ai.cards import build_result_cards_json
-
-            cards = build_result_cards_json(payload)
-            logger.info(
-                f"[game_data_ai] lark.send_cards chat={chat_id} "
-                f"trace={payload.get('trace_id')} "
-                f"count={len(cards)} "
-                f"mode={(payload.get('rendering') or {}).get('preferred')}"
+        if status == "awaiting_ingest_decision" and trace_id:
+            self._doc_sessions[trace_id] = {
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }
+            self._user_active_trace[user_id] = trace_id
+            self._ingest_cards_sent.setdefault(trace_id, set())
+            yield event.plain_result(
+                "文档已解析，请在下方卡片选择是否入库；全部确认后将返回分析结果。"
             )
-            sent_card = False
-            for i, card in enumerate(cards):
-                ok = await self._try_send_lark_card(event, card, chat_id, message_id)
-                sent_card = sent_card or ok
-                if ok:
-                    logger.info(
-                        f"[game_data_ai] lark.card_sent ok {i + 1}/{len(cards)}"
-                    )
-                else:
-                    logger.warning(
-                        f"[game_data_ai] lark.card_sent failed {i + 1}/{len(cards)}"
-                    )
-                if i + 1 < len(cards):
-                    await asyncio.sleep(0.35)
-            if sent_card and len(cards) > 1:
-                logger.info(f"[game_data_ai] lark.cards_all_sent n={len(cards)}")
-            elif not sent_card:
-                logger.warning("[game_data_ai] lark.card_sent failed, fallback text")
-            answer = payload.get("answer") or {}
-            if not sent_card:
-                yield event.plain_result(
-                    f"【{answer.get('title', '分析结果')}】\n"
-                    f"{answer.get('summary', '')}\n"
-                    + "\n".join(f"- {f}" for f in (answer.get("facts") or [])[:5])
-                    + f"\n\ntrace: {payload.get('trace_id', '')}\n"
-                    f"模板: {answer.get('template_id', '')}\n"
-                    f"口径: {answer.get('methodology', '')}"
+            timeout = float(os.getenv("GAME_DATA_AI_INGEST_WAIT_SEC", "180"))
+            try:
+                answered = await asyncio.wait_for(
+                    self.sse_hub.wait_answered(trace_id),
+                    timeout=timeout,
                 )
+            except asyncio.TimeoutError:
+                self.sse_hub.cancel_wait(trace_id)
+                yield event.plain_result("等待入库确认超时，请重新提问。")
+                return
+            finally:
+                self._doc_sessions.pop(trace_id, None)
+                self._ingest_cards_sent.pop(trace_id, None)
+                if self._user_active_trace.get(user_id) == trace_id:
+                    del self._user_active_trace[user_id]
+            payload = self._payload_from_sse_answered(answered)
+            for line in await self._deliver_query_payload(
+                event, chat_id, message_id, payload
+            ):
+                yield event.plain_result(line)
             return
 
-        if status == "denied":
-            err = payload.get("error") or {}
-            yield event.plain_result(build_denied_plain(err))
-            if err.get("code") == "project_unresolved":
-                yield event.plain_result("请补充项目名后重试，例如：「仙魔项目活动流水怎么样？」")
-            return
-
-        err = payload.get("error") or {}
-        yield event.plain_result(
-            build_denied_plain(err)
-            if err
-            else card_json_to_plain_fallback(payload)
-        )
+        for line in await self._deliver_query_payload(
+            event, chat_id, message_id, payload
+        ):
+            yield event.plain_result(line)

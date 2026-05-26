@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from urllib.parse import urlencode
 
 import aiohttp
 from astrbot.api import logger
@@ -19,6 +20,36 @@ class GameDataAIClient:
         )
         self.service_token = os.getenv("GAME_DATA_AI_SERVICE_TOKEN", "dev-service-token")
         self.shared_secret = os.getenv("GAME_DATA_AI_SHARED_SECRET", "dev-shared-secret")
+
+    def abs_url(self, path_or_url: str) -> str:
+        if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+            return path_or_url
+        if not path_or_url.startswith("/"):
+            path_or_url = "/" + path_or_url
+        return f"{self.base_url}{path_or_url}"
+
+    def sse_stream_request(
+        self, feishu_user_id: str, last_event_id: int = 0
+    ) -> tuple[str, dict[str, str]]:
+        path = "/api/v1/events/stream"
+        query = urlencode({"feishu_user_id": feishu_user_id})
+        url = f"{self.base_url}{path}?{query}"
+        headers = {
+            "Accept": "text/event-stream",
+            **build_identity_headers(
+                shared_secret=self.shared_secret,
+                feishu_user_id=feishu_user_id,
+                feishu_chat_id=feishu_user_id,
+                feishu_message_id=f"sse_{feishu_user_id[:24]}",
+                method="GET",
+                path=path,
+                raw_body=b"",
+                service_token=self.service_token,
+            ),
+        }
+        if last_event_id > 0:
+            headers["Last-Event-ID"] = str(last_event_id)
+        return url, headers
 
     async def _post_json(
         self,
@@ -85,7 +116,7 @@ class GameDataAIClient:
         )
         return payload
 
-    async def query_metric(
+    async def chat_messages(
         self,
         *,
         feishu_user_id: str,
@@ -94,8 +125,9 @@ class GameDataAIClient:
         question: str,
         chat_type: str = "p2p",
         session_id: str | None = None,
+        attachments: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
-        path = "/api/v1/query/metric"
+        path = "/api/v1/chat/messages"
         body_obj: dict[str, Any] = {
             "feishu_user_id": feishu_user_id,
             "feishu_chat_id": feishu_chat_id,
@@ -105,9 +137,12 @@ class GameDataAIClient:
         }
         if session_id:
             body_obj["session_id"] = session_id
+        if attachments:
+            body_obj["attachments"] = attachments
         logger.info(
             f"[game_data_ai] api.request POST {path} "
-            f"user={feishu_user_id} msg={feishu_message_id} question={question[:80]}"
+            f"user={feishu_user_id} msg={feishu_message_id} "
+            f"attachments={len(attachments or [])} question={question[:80]}"
         )
         timeout = float(os.getenv("GAME_DATA_AI_QUERY_TIMEOUT_SEC", "90"))
         payload = await self._post_json(
@@ -123,9 +158,58 @@ class GameDataAIClient:
         logger.info(
             f"[game_data_ai] api.response status={payload.get('status')} "
             f"trace={payload.get('trace_id')} rendering={rendering.get('preferred')} "
-            f"charts={len(answer.get('charts') or [])}"
+            f"charts={len(answer.get('charts') or [])} "
+            f"notices={len(answer.get('notices') or [])}"
         )
         return payload
+
+    async def query_metric(
+        self,
+        *,
+        feishu_user_id: str,
+        feishu_chat_id: str,
+        feishu_message_id: str,
+        question: str,
+        chat_type: str = "p2p",
+        session_id: str | None = None,
+        attachments: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Backward-compatible alias → chat/messages."""
+        return await self.chat_messages(
+            feishu_user_id=feishu_user_id,
+            feishu_chat_id=feishu_chat_id,
+            feishu_message_id=feishu_message_id,
+            question=question,
+            chat_type=chat_type,
+            session_id=session_id,
+            attachments=attachments,
+        )
+
+    async def ingest_decision(
+        self,
+        *,
+        document_id: str,
+        feishu_user_id: str,
+        feishu_chat_id: str,
+        feishu_message_id: str,
+        trace_id: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        path = f"/api/v1/documents/{document_id}/ingest-decision"
+        body_obj = {
+            "feishu_user_id": feishu_user_id,
+            "trace_id": trace_id,
+            "decision": decision,
+            "client_action_id": feishu_message_id,
+        }
+        return await self._post_json(
+            path,
+            body_obj,
+            feishu_user_id=feishu_user_id,
+            feishu_chat_id=feishu_chat_id,
+            feishu_message_id=feishu_message_id,
+            timeout_sec=30,
+        )
 
     async def create_schedule(
         self,

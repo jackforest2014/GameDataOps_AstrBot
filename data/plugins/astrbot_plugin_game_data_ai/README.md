@@ -26,3 +26,16 @@
 ## 依赖
 
 需先启动 `game_data_ai` 后端：`go run ./cmd/server`（默认 `:8080`）。
+
+## v1.1 文档问数（`feat/feishu-doc-v1.1`）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GAME_DATA_AI_SSE_ENABLED` | `true` | 是否维持 `GET /api/v1/events/stream` |
+| `GAME_DATA_AI_INGEST_WAIT_SEC` | `180` | 等待入库确认 + SSE 最终答案超时（秒） |
+
+- 问数入口：`POST /api/v1/chat/messages`（消息中含飞书文档链接会自动带 `attachments`）
+- 入库确认：SSE `document.ingest.confirm_required` → 卡片按钮 → `ingest-decision`
+- 最终答案：SSE `document.chat.answered`（勿轮询 HTTP）
+
+建议在独立 worktree 开发：`GameDataOps_AstrBot-feishu-doc`，与 Go 仓 `game_data_ai-feishu-doc` 联调。
