@@ -157,9 +157,11 @@ class GameDataAIClient:
         rendering = payload.get("rendering") or {}
         logger.info(
             f"[game_data_ai] api.response status={payload.get('status')} "
-            f"trace={payload.get('trace_id')} rendering={rendering.get('preferred')} "
+            f"trace={payload.get('trace_id')} query_mode={answer.get('query_mode', 'template')} "
+            f"rendering={rendering.get('preferred')} "
+            f"adhoc_rows={(answer.get('adhoc_table') or {}).get('row_count', 0)} "
             f"charts={len(answer.get('charts') or [])} "
-            f"notices={len(answer.get('notices') or [])}"
+            f"notices={len(answer.get('notices') or [])}")
         )
         return payload
 

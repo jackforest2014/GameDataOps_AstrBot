@@ -521,6 +521,51 @@ def _section_header_md(sec: dict[str, Any]) -> str:
     return header
 
 
+def _notice_markdown_content(notice: dict[str, Any]) -> str:
+    level = (notice.get("level") or "warning").lower()
+    icon = "⚠️" if level == "warning" else "ℹ️"
+    title_color = "red" if level == "warning" else "blue"
+    title = notice.get("title") or "提示"
+    body = (notice.get("body") or "").strip()
+    md_parts = [f"{icon} <font color='{title_color}'>**{title}**</font>"]
+    if body:
+        md_parts.append(body)
+    formula = (notice.get("formula") or "").strip()
+    if formula:
+        md_parts.append(f"```\n{formula}\n```")
+    return "\n".join(md_parts)
+
+
+def _notice_callout_element(notice: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "background_style": "grey",
+        "horizontal_spacing": "default",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [
+                    {"tag": "markdown", "content": _notice_markdown_content(notice)},
+                ],
+            }
+        ],
+    }
+
+
+def _append_answer_notices(
+    elements: list[dict[str, Any]], answer: dict[str, Any]
+) -> None:
+    notices = answer.get("notices") or []
+    for notice in notices:
+        if isinstance(notice, dict) and (notice.get("title") or notice.get("body")):
+            elements.append(_notice_callout_element(notice))
+            elements.append({"tag": "hr"})
+
+
 def _build_pay_weekly_sec1_elements(
     sec: dict[str, Any],
     *,
@@ -685,6 +730,8 @@ def build_pay_weekly_cards_json(payload: dict[str, Any]) -> list[dict[str, Any]]
 
 def build_result_cards_json(payload: dict[str, Any]) -> list[dict[str, Any]]:
     answer = payload.get("answer") or {}
+    if answer.get("query_mode") == "adhoc" or answer.get("adhoc_table"):
+        return [build_adhoc_result_card_json(payload)]
     sections = answer.get("sections") or []
     if sections and _is_pay_weekly_sections(sections):
         return build_pay_weekly_cards_json(payload)
@@ -819,6 +866,161 @@ def _decline_explore_block(facts: list[str]) -> str:
         return ""
     lines = [f"• {f}" for f in explore]
     return "**环比下降 · 自动探查**\n" + "\n".join(lines)
+def _format_adhoc_cell(value: Any, col_type: str) -> str:
+    if value is None:
+        return "—"
+    if col_type == "number":
+        try:
+            num = float(value)
+            if abs(num) >= 1000:
+                return f"{num:,.0f}"
+            if num == int(num):
+                return str(int(num))
+            return f"{num:.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+    text = str(value)
+    if len(text) > 48:
+        return text[:45] + "…"
+    return text
+
+
+def _adhoc_table_markdown(table: dict[str, Any] | None, *, max_rows: int = 40) -> str:
+    """Generic markdown table from platform answer.adhoc_table."""
+    if not table:
+        return ""
+    cols = table.get("columns") or []
+    rows = table.get("rows") or []
+    if not rows:
+        return "**查询结果**\n<font color='grey'>无匹配行。</font>"
+    if not cols:
+        cols = [{"key": k, "label": k, "type": "string"} for k in rows[0].keys()]
+    headers = [c.get("label") or c.get("key") or "?" for c in cols]
+    lines = [
+        "**查询结果**",
+        "<font color='grey'>按需 SQL 查询；下表为平台返回的原始行（最多展示 "
+        f"{max_rows} 行）。</font>",
+        "",
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    display = rows[:max_rows]
+    for row in display:
+        cells = [
+            _format_adhoc_cell(row.get(c.get("key", "")), c.get("type", "string"))
+            for c in cols
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    row_count = int(table.get("row_count") or len(rows))
+    truncated = bool(table.get("truncated")) or len(rows) > max_rows
+    if truncated:
+        lines.append("")
+        lines.append(
+            f"<font color='grey'>共 {row_count} 行"
+            f"{'（已截断展示）' if truncated else ''}。</font>"
+        )
+    return "\n".join(lines)
+
+
+def _adhoc_trace_block(answer: dict[str, Any], trace_id: str, template_id: str) -> str:
+    meta = answer.get("adhoc_meta") or {}
+    attempts = meta.get("attempts")
+    codes = meta.get("codes") or []
+    extra = ""
+    if attempts:
+        extra += f"\n生成轮次 {attempts}"
+    if codes:
+        extra += f"\n审核码 {', '.join(str(c) for c in codes[:5])}"
+    return (
+        f"**追溯信息**\n"
+        f"trace `{trace_id}` · 模式 `adhoc` · 模板 `{template_id}`{extra}\n"
+        f"口径 {answer.get('methodology', '')}\n"
+        f"SQL digest `{answer.get('sql_digest', '')}`"
+    )
+
+
+def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
+    """Feishu card for query_mode=adhoc (catalog.adhoc)."""
+    answer = payload.get("answer") or {}
+    trace_id = payload.get("trace_id", "")
+    session_id = payload.get("session_id", "")
+    template_id = answer.get("template_id", "catalog.adhoc")
+    summary = answer.get("summary", "")
+    facts = answer.get("facts") or []
+    facts_md = "\n".join(f"• {f}" for f in facts[:5])
+
+    elements: list[dict[str, Any]] = [
+        {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"},
+    ]
+    _append_answer_notices(elements, answer)
+    table_md = _adhoc_table_markdown(answer.get("adhoc_table"))
+    if table_md:
+        elements.append({"tag": "markdown", "content": table_md})
+    elif facts_md:
+        elements.append({"tag": "markdown", "content": f"**说明**\n{facts_md}"})
+    if facts_md and table_md:
+        elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
+
+    rag_md = _lineage_rag_block(answer.get("rag_citations") or [])
+    if rag_md:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": rag_md})
+    exp_md = _lineage_experience_block(answer.get("experience_reuse"))
+    if exp_md:
+        elements.append({"tag": "markdown", "content": exp_md})
+    elements.append({"tag": "hr"})
+    elements.append(
+        {"tag": "markdown", "content": _adhoc_trace_block(answer, trace_id, template_id)}
+    )
+    elements.append(
+        {
+            "tag": "markdown",
+            "content": (
+                "<font color='grey'>反馈与沉淀为独立动作：可先点「有用」，"
+                "再点「沉淀模板候选」。</font>"
+            ),
+        }
+    )
+    buttons = [
+        _feedback_button("有用", "useful", trace_id, session_id, template_id, primary=True),
+        _feedback_button("Bad Case", "bad_case", trace_id, session_id, template_id),
+        _feedback_button(
+            "沉淀模板候选", "save_template_candidate", trace_id, session_id, template_id
+        ),
+    ]
+    elements.append(
+        {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [btn],
+                }
+                for btn in buttons
+            ],
+        }
+    )
+
+    card = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": answer.get("title", "按需查询结果")},
+            "subtitle": {
+                "tag": "plain_text",
+                "content": "按需查询 · 数据表",
+            },
+            "template": "wathet",
+        },
+        "body": {"elements": elements},
+    }
+    log_card_build(payload, card, part=1, parts=1)
+    return card
+
 
 
 def log_card_build(
@@ -835,19 +1037,23 @@ def log_card_build(
     elements = body.get("elements") or []
     ncharts = _count_chart_elements(elements)
     part_s = f" part={part}/{parts}" if parts > 1 else ""
+    adhoc_table = answer.get("adhoc_table") or {}
     logger.info(
         "[game_data_ai] card.build "
         f"trace={payload.get('trace_id')} "
+        f"query_mode={answer.get('query_mode', 'template')} "
         f"mode={rendering.get('preferred', 'table')} "
         f"title={answer.get('title', '')} "
         f"metrics={len(answer.get('metrics') or [])} "
         f"chart_points={len(answer.get('chart_series') or [])} "
+        f"adhoc_rows={adhoc_table.get('row_count', 0)} "
         f"elements={len(elements)} charts={ncharts}{part_s} "
         f"header_template={header.get('template', 'blue')}"
     )
     logger.info(
         "[game_data_ai] card.answer "
         f"summary={answer.get('summary', '')[:120]} "
+        f"notices={len(answer.get('notices') or [])} "
         f"facts={answer.get('facts') or []} "
         f"chart_series={answer.get('chart_series') or []} "
         f"rag_citations={len(answer.get('rag_citations') or [])} "
@@ -857,6 +1063,8 @@ def log_card_build(
 
 def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     answer = payload.get("answer") or {}
+    if answer.get("query_mode") == "adhoc" or answer.get("adhoc_table"):
+        return build_adhoc_result_card_json(payload)
     rendering = payload.get("rendering") or {}
     trace_id = payload.get("trace_id", "")
     session_id = payload.get("session_id", "")
