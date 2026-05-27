@@ -40,6 +40,7 @@ from game_data_ai.attachments import build_attachments
 from game_data_ai.card_action import register_feedback_card_handler
 from game_data_ai.client import GameDataAIClient
 from game_data_ai.event_stream import DocumentSSEHub
+from game_data_ai.auth_card import build_feishu_auth_card_json
 from game_data_ai.ingest_card import build_ingest_confirm_card
 from game_data_ai.routing import detect_route
 from game_data_ai.routing_resolve import resolve_route
@@ -82,6 +83,8 @@ class GameDataAIPlugin(star.Star):
         self._user_active_trace: dict[str, str] = {}
         self._user_last_chat: dict[str, str] = {}
         self._ingest_cards_sent: dict[str, set[str]] = {}
+        # feishu_user_id -> buffered confirm_required before HTTP returns trace_id
+        self._buffered_ingest_confirms: dict[str, list[dict]] = {}
         register_feedback_card_handler(
             self.client,
             self._send_card_from_action,
@@ -340,6 +343,44 @@ class GameDataAIPlugin(star.Star):
             lines = "\n".join(f"- {it.get('label', '')}" for it in items[:10])
             yield event.plain_result(f"请选择要取消的任务（请在卡片中操作）：\n{lines}")
 
+    async def _send_ingest_confirm_card(
+        self,
+        *,
+        trace_id: str,
+        chat_id: str,
+        document_id: str,
+        title: str,
+    ) -> bool:
+        if not trace_id or not chat_id or not document_id:
+            return False
+        shown = self._ingest_cards_sent.setdefault(trace_id, set())
+        if document_id in shown:
+            return False
+        shown.add(document_id)
+        card = build_ingest_confirm_card(
+            document_id=document_id,
+            title=title,
+            trace_id=trace_id,
+        )
+        ok = await self._send_card_from_action(None, card, chat_id)
+        if not ok:
+            logger.warning(
+                f"[game_data_ai] ingest.card_send_failed trace={trace_id} doc={document_id}"
+            )
+        return ok
+
+    async def _flush_buffered_ingest_cards(
+        self, feishu_user_id: str, trace_id: str, chat_id: str
+    ) -> None:
+        buffered = self._buffered_ingest_confirms.pop(feishu_user_id, [])
+        for data in buffered:
+            await self._send_ingest_confirm_card(
+                trace_id=trace_id,
+                chat_id=chat_id,
+                document_id=str(data.get("document_id") or ""),
+                title=str(data.get("title") or ""),
+            )
+
     async def _on_document_sse(
         self,
         feishu_user_id: str,
@@ -348,23 +389,24 @@ class GameDataAIPlugin(star.Star):
         data: dict,
     ) -> None:
         if event_type == "document.ingest.confirm_required":
-            trace_id = self._user_active_trace.get(feishu_user_id, "")
-            if not trace_id:
-                return
-            sess = self._doc_sessions.get(trace_id)
-            if not sess:
-                return
-            doc_id = str(data.get("document_id") or "")
-            shown = self._ingest_cards_sent.setdefault(trace_id, set())
-            if doc_id in shown:
-                return
-            shown.add(doc_id)
-            card = build_ingest_confirm_card(
-                document_id=doc_id,
-                title=str(data.get("title") or ""),
-                trace_id=trace_id,
+            trace_id = str(data.get("trace_id") or "") or self._user_active_trace.get(
+                feishu_user_id, ""
             )
-            await self._send_card_from_action(None, card, sess["chat_id"])
+            if not trace_id:
+                self._buffered_ingest_confirms.setdefault(feishu_user_id, []).append(
+                    dict(data)
+                )
+                return
+            chat_id = self._user_last_chat.get(feishu_user_id, feishu_user_id)
+            sess = self._doc_sessions.get(trace_id)
+            if sess:
+                chat_id = sess["chat_id"]
+            await self._send_ingest_confirm_card(
+                trace_id=trace_id,
+                chat_id=chat_id,
+                document_id=str(data.get("document_id") or ""),
+                title=str(data.get("title") or ""),
+            )
             return
 
         if event_type == "document.auth_required":
@@ -372,23 +414,7 @@ class GameDataAIPlugin(star.Star):
             chat_id = self._user_last_chat.get(feishu_user_id, feishu_user_id)
             await self._send_card_from_action(
                 None,
-                {
-                    "config": {"wide_screen_mode": True},
-                    "header": {
-                        "template": "orange",
-                        "title": {"tag": "plain_text", "content": "需要飞书授权"},
-                    },
-                    "elements": [
-                        {
-                            "tag": "markdown",
-                            "content": (
-                                "访问该文档需要你的飞书账号授权。\n"
-                                f"请在浏览器打开并完成授权：\n{auth_url}\n\n"
-                                "完成后回到本对话重新发送文档链接。"
-                            ),
-                        }
-                    ],
-                },
+                build_feishu_auth_card_json(auth_url=auth_url),
                 chat_id,
             )
 
@@ -525,36 +551,37 @@ class GameDataAIPlugin(star.Star):
                 yield event.plain_result(line)
             return
 
-        if status == "awaiting_ingest_decision" and trace_id:
+        if trace_id:
+            self._user_active_trace[user_id] = trace_id
             self._doc_sessions[trace_id] = {
                 "chat_id": chat_id,
                 "message_id": message_id,
             }
-            self._user_active_trace[user_id] = trace_id
-            self._ingest_cards_sent.setdefault(trace_id, set())
-            yield event.plain_result(
-                "文档已解析，请在下方卡片选择是否入库；全部确认后将返回分析结果。"
-            )
-            timeout = float(os.getenv("GAME_DATA_AI_INGEST_WAIT_SEC", "180"))
-            try:
-                answered = await asyncio.wait_for(
-                    self.sse_hub.wait_answered(trace_id),
-                    timeout=timeout,
+
+        ingest_offer = payload.get("ingest_offer") or {}
+        if trace_id and ingest_offer:
+            offer_trace = str(ingest_offer.get("trace_id") or trace_id)
+            for doc in ingest_offer.get("documents") or []:
+                await self._send_ingest_confirm_card(
+                    trace_id=offer_trace,
+                    chat_id=chat_id,
+                    document_id=str(doc.get("document_id") or ""),
+                    title=str(doc.get("title") or ""),
                 )
-            except asyncio.TimeoutError:
-                self.sse_hub.cancel_wait(trace_id)
-                yield event.plain_result("等待入库确认超时，请重新提问。")
-                return
-            finally:
-                self._doc_sessions.pop(trace_id, None)
-                self._ingest_cards_sent.pop(trace_id, None)
-                if self._user_active_trace.get(user_id) == trace_id:
-                    del self._user_active_trace[user_id]
-            payload = self._payload_from_sse_answered(answered)
-            for line in await self._deliver_query_payload(
-                event, chat_id, message_id, payload
-            ):
-                yield event.plain_result(line)
+            await self._flush_buffered_ingest_cards(user_id, offer_trace, chat_id)
+
+        # Legacy: old backend may still return awaiting_ingest_decision without answer.
+        if status == "awaiting_ingest_decision" and not payload.get("answer"):
+            for doc in payload.get("pending_documents") or []:
+                await self._send_ingest_confirm_card(
+                    trace_id=trace_id,
+                    chat_id=chat_id,
+                    document_id=str(doc.get("document_id") or ""),
+                    title=str(doc.get("title") or ""),
+                )
+            yield event.plain_result(
+                "文档已解析。若未看到入库卡片，请重载插件后重试；分析结果将随后返回。"
+            )
             return
 
         for line in await self._deliver_query_payload(

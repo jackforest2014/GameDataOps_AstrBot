@@ -805,6 +805,22 @@ def _lineage_experience_block(exp: dict[str, Any] | None) -> str:
     )
 
 
+def _split_decline_facts(facts: list[str]) -> tuple[list[str], list[str]]:
+    """Separate rule-based decline exploration bullets from headline facts."""
+    for i, f in enumerate(facts):
+        if str(f).startswith("【环比下降探查】"):
+            return facts[:i], facts[i:]
+    return facts, []
+
+
+def _decline_explore_block(facts: list[str]) -> str:
+    _, explore = _split_decline_facts(facts)
+    if not explore:
+        return ""
+    lines = [f"• {f}" for f in explore]
+    return "**环比下降 · 自动探查**\n" + "\n".join(lines)
+
+
 def log_card_build(
     payload: dict[str, Any],
     card: dict[str, Any],
@@ -854,7 +870,8 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
 
     summary = answer.get("summary", "")
     sections = answer.get("sections") or []
-    facts_md = "\n".join(f"• {f}" for f in facts[:5])
+    head_facts, _ = _split_decline_facts(facts)
+    facts_md = "\n".join(f"• {f}" for f in head_facts[:5])
     trace_block = (
         f"**追溯信息**\n"
         f"trace `{trace_id}` · 模板 `{template_id}`\n"
@@ -926,9 +943,11 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
             )
         elements.extend(_metric_columns(metrics[:2]))
         if facts_md:
-            elements.append(
-                {"tag": "markdown", "content": f"**结论摘要**\n{facts_md}"}
-            )
+            decline_md = _decline_explore_block(facts)
+            body = f"**结论摘要**\n{facts_md}"
+            if decline_md:
+                body += f"\n\n{decline_md}"
+            elements.append({"tag": "markdown", "content": body})
     else:
         elements.append(
             {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"}
@@ -955,9 +974,13 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
                 trace_id=trace_id,
                 used_chart_ids=used_chart_element_ids,
             )
-        if facts_md:
+        if facts_md or facts:
             label = "**Phase 2 · 结论摘要**" if sections else "**关键事实**"
-            elements.append({"tag": "markdown", "content": f"{label}\n{facts_md}"})
+            body = f"{label}\n{facts_md}" if facts_md else label
+            decline_md = _decline_explore_block(facts)
+            if decline_md:
+                body += f"\n\n{decline_md}"
+            elements.append({"tag": "markdown", "content": body})
         hint = _table_mode_hint(chart_series)
         if hint and not daily_rows and not charts:
             elements.append({"tag": "markdown", "content": hint})

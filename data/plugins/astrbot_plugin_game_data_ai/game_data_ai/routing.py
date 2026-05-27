@@ -10,6 +10,8 @@ import os
 import re
 import time
 
+from .attachments import build_attachments
+
 # 定时：用短语，避免「每天付费金额」里的「每天」误判
 SCHEDULE_PHRASES = (
     "定时推送",
@@ -61,6 +63,10 @@ def detect_route(text: str) -> str:
     t = (text or "").strip().lower()
     if not t:
         return "ignore"
+    if build_attachments(text or ""):
+        return "query"
+    if any(k in t for k in ("飞书文档", "wiki", "配置文档", "文档里", "文档中")):
+        return "query"
     if any(k in t for k in CANCEL_KEYWORDS) and any(
         k in t for k in ("定时", "推送", "订阅")
     ):

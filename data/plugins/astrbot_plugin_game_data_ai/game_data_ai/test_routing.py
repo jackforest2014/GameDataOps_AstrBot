@@ -17,3 +17,11 @@ def test_daily_push_phrase_is_schedule():
 
 def test_cancel_schedule():
     assert detect_route("取消定时推送") == "cancel"
+
+
+def test_feishu_doc_url_routes_to_query():
+    q = (
+        "朱雀活动配置文档里高付费目标是什么？"
+        "https://boke.feishu.cn/wiki/Q9n7wk1DCiFlBtkBoPFcIn2RnPe"
+    )
+    assert detect_route(q) == "query"

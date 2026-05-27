@@ -8,6 +8,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from .attachments import build_attachments
 from .routing import detect_route, is_date_follow_up, is_display_refinement
 
 
@@ -24,6 +25,10 @@ async def resolve_route(
     t = (text or "").strip()
     if not t:
         return "ignore"
+
+    # Feishu doc Q&A must use chat/messages (attachments), never LLM route=ignore.
+    if build_attachments(t):
+        return "query"
 
     use_llm = os.getenv("GAME_DATA_AI_ROUTE_USE_LLM", "true").lower() not in (
         "0",

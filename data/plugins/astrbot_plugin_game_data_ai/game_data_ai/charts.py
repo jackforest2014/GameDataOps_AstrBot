@@ -17,6 +17,9 @@ _WK_CMP_BAR_HEIGHT_PX = 72
 _WK_CMP_LEGEND_HEIGHT_PX = 34
 _DAILY_BAR_BAND_PX = 14
 _DAILY_BAR_BASE_PX = 28
+# 按日流水折线：横轴日期、留足左侧与底部标签区
+_DAILY_LINE_HEIGHT_PX = 240
+_DAILY_LINE_ASPECT = "5:2"
 
 
 def _period_color_scale(*, field: str | None = "period") -> dict[str, Any]:
@@ -346,18 +349,59 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
     is_line = chart_type == "line"
     use_horizontal = chart_type == "bar" and not multi_series
     is_daily_revenue = chart_id in ("p1_revenue_bar", "p2_revenue_bar")
+    is_daily_trend_line = is_daily_revenue and is_line
 
     chart_body: dict[str, Any] = {
         "type": "line" if is_line else "bar",
         "title": {"text": title, "textStyle": {"fontSize": 12}},
         "data": {"values": values},
-        "label": {"visible": not is_line},
+        "label": {"visible": not is_line and not is_daily_trend_line},
     }
     height_px: int | None = None
     margin = "0"
     aspect_ratio = "4:3"
 
-    if multi_series and series_field:
+    if is_daily_trend_line:
+        n_pts = max(len(labels), len(values), 1)
+        chart_body["type"] = "line"
+        chart_body["xField"] = x_field
+        chart_body["yField"] = y_field
+        chart_body["padding"] = {"top": 16, "bottom": 36, "left": 52, "right": 20}
+        chart_body["point"] = {
+            "visible": True,
+            "style": {
+                "size": 8,
+                "fill": "#3370FF",
+                "stroke": "#ffffff",
+                "lineWidth": 1,
+            },
+        }
+        chart_body["line"] = {"style": {"lineWidth": 2.5, "curveType": "monotone"}}
+        chart_body["axes"] = [
+            {
+                "orient": "left",
+                "title": {
+                    "visible": True,
+                    "text": "流水（万元）",
+                    "textStyle": {"fontSize": 10},
+                },
+                "label": {"style": {"fontSize": 10}},
+            },
+            {
+                "orient": "bottom",
+                "title": {"visible": False},
+                "label": {
+                    "visible": True,
+                    "style": {"fontSize": 10},
+                },
+                "paddingInner": 0.25,
+                "paddingOuter": 0.12,
+            },
+        ]
+        height_px = min(280, _DAILY_LINE_HEIGHT_PX + max(0, n_pts - 7) * 6)
+        aspect_ratio = _DAILY_LINE_ASPECT
+        margin = "8px 4px"
+    elif multi_series and series_field:
         chart_body["seriesField"] = series_field
         chart_body["xField"] = x_field
         chart_body["yField"] = y_field
@@ -394,7 +438,7 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
                 "label": {"style": {"fontSize": 9}},
             },
         ]
-        if is_daily_revenue:
+        if is_daily_revenue and not is_line:
             height_px = _height_for_horizontal_bars(
                 len(labels), per_band=_DAILY_BAR_BAND_PX, base=_DAILY_BAR_BASE_PX
             )
@@ -417,7 +461,7 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
             },
             {"orient": "bottom", "title": {"visible": False}},
         ]
-    if is_line and not multi_series:
+    if is_line and not multi_series and not is_daily_trend_line:
         chart_body["point"] = {"visible": True}
         chart_body["line"] = {"style": {"lineWidth": 2}}
 
