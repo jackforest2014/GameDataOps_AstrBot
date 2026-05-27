@@ -3,6 +3,7 @@
 from game_data_ai.cards import (
     _adhoc_table_element,
     _adhoc_table_markdown,
+    _section_header_element,
     _wow_week_compare_table_element,
     build_adhoc_result_card_json,
     build_result_cards_json,
@@ -74,6 +75,28 @@ def test_build_adhoc_result_card_json_uses_native_table():
     tables = [el for el in body if el.get("tag") == "table"]
     assert len(tables) == 1
     assert tables[0]["columns"][0]["data_type"] == "number"
+
+
+def test_section_header_gain_loss_use_white_text_on_tint():
+    gain = _section_header_element(
+        {
+            "stage_label": "二",
+            "title": "涨幅贡献 Top（按变化金额）",
+            "summary": "流水增加的计费点 Top 10。",
+        }
+    )
+    loss = _section_header_element(
+        {
+            "stage_label": "三",
+            "title": "跌幅贡献 Top（按变化金额）",
+            "summary": "流水减少的计费点 Top 10。",
+        }
+    )
+    for el, bg in ((gain, "green"), (loss, "red")):
+        assert el["background_style"] == bg
+        md = el["columns"][0]["elements"][0]["content"]
+        assert "<font color='white'>" in md
+        assert "Top" in md
 
 
 def test_build_adhoc_sections_use_native_tables():

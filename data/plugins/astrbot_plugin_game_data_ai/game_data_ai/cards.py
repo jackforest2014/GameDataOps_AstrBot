@@ -512,20 +512,23 @@ def _append_card_footer(
     )
 
 
-def _section_header_md(sec: dict[str, Any]) -> str:
+def _section_header_md(sec: dict[str, Any], *, text_color: str | None = None) -> str:
     label = sec.get("stage_label") or ""
     title = sec.get("title") or label
     header = f"**{label} · {title}**" if label else f"**{title}**"
     if sec.get("summary"):
         header += f"\n{sec['summary']}"
+    if text_color:
+        return f"<font color='{text_color}'>{header}</font>"
     return header
 
 
 def _section_header_element(sec: dict[str, Any]) -> dict[str, Any]:
     """Section title element with optional gain/loss background tint."""
     title = str(sec.get("title") or "")
-    md = _section_header_md(sec)
+    # 深绿/深红底需浅色字；飞书 markdown 支持 white 等枚举色名。
     if "涨幅贡献" in title:
+        md = _section_header_md(sec, text_color="white")
         return {
             "tag": "column_set",
             "flex_mode": "none",
@@ -542,6 +545,7 @@ def _section_header_element(sec: dict[str, Any]) -> dict[str, Any]:
             ],
         }
     if "跌幅贡献" in title:
+        md = _section_header_md(sec, text_color="white")
         return {
             "tag": "column_set",
             "flex_mode": "none",
@@ -557,7 +561,7 @@ def _section_header_element(sec: dict[str, Any]) -> dict[str, Any]:
                 }
             ],
         }
-    return {"tag": "markdown", "content": md}
+    return {"tag": "markdown", "content": _section_header_md(sec)}
 
 
 def _notice_markdown_content(notice: dict[str, Any]) -> str:
