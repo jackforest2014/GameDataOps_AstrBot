@@ -161,7 +161,7 @@ class GameDataAIClient:
             f"rendering={rendering.get('preferred')} "
             f"adhoc_rows={(answer.get('adhoc_table') or {}).get('row_count', 0)} "
             f"charts={len(answer.get('charts') or [])} "
-            f"notices={len(answer.get('notices') or [])}")
+            f"notices={len(answer.get('notices') or [])}"
         )
         return payload
 
