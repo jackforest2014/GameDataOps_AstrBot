@@ -1,7 +1,9 @@
 """Unit tests for adhoc_table Feishu card rendering."""
 
 from game_data_ai.cards import (
+    _adhoc_table_element,
     _adhoc_table_markdown,
+    _wow_week_compare_table_element,
     build_adhoc_result_card_json,
     build_result_cards_json,
 )
@@ -22,6 +24,93 @@ def test_adhoc_table_markdown_renders_columns_and_rows():
         }
     )
     assert "渠道" in md and "ios" in md and "340" in md
+
+
+def test_adhoc_table_element_native_text_and_freeze():
+    el = _adhoc_table_element(
+        {
+            "columns": [
+                {"key": "prop_name", "label": "计费点", "type": "string"},
+                {"key": "change_amount", "label": "变化金额(元)", "type": "string"},
+            ],
+            "rows": [
+                {
+                    "prop_name": "198元灵武召唤礼包",
+                    "change_amount": "+160,176",
+                },
+            ],
+            "row_count": 1,
+        },
+        element_id="gdTbl0",
+    )
+    assert el is not None
+    assert el["tag"] == "table"
+    assert el["freeze_first_column"] is True
+    assert el["columns"][0]["data_type"] == "text"
+    assert el["rows"][0]["prop_name"] == "198元灵武召唤礼包"
+
+
+def test_build_adhoc_result_card_json_uses_native_table():
+    card = build_adhoc_result_card_json(
+        {
+            "trace_id": "tr_adhoc",
+            "session_id": "sess_1",
+            "answer": {
+                "title": "仙魔 · 按需查询",
+                "summary": "返回 2 行。",
+                "query_mode": "adhoc",
+                "template_id": "catalog.adhoc",
+                "adhoc_table": {
+                    "columns": [{"key": "n", "label": "N", "type": "number"}],
+                    "rows": [{"n": 1}],
+                    "row_count": 1,
+                },
+                "methodology": "catalog.adhoc",
+                "sql_digest": "abc123",
+            },
+        }
+    )
+    body = card["body"]["elements"]
+    tables = [el for el in body if el.get("tag") == "table"]
+    assert len(tables) == 1
+    assert tables[0]["columns"][0]["data_type"] == "number"
+
+
+def test_build_adhoc_sections_use_native_tables():
+    card = build_adhoc_result_card_json(
+        {
+            "trace_id": "tr_wow",
+            "session_id": "sess_1",
+            "answer": {
+                "summary": "双周分析",
+                "query_mode": "adhoc",
+                "sections": [
+                    {
+                        "stage_label": "步骤 1",
+                        "title": "概况",
+                        "adhoc_table": {
+                            "columns": [{"key": "a", "label": "A", "type": "string"}],
+                            "rows": [{"a": "1"}],
+                            "row_count": 1,
+                        },
+                    },
+                    {
+                        "stage_label": "步骤 3",
+                        "title": "对比",
+                        "compare_rows": [
+                            {"metric": "流水", "p1": "1", "p2": "2", "delta": "+1"},
+                        ],
+                    },
+                ],
+            },
+        }
+    )
+    tables = [el for el in card["body"]["elements"] if el.get("tag") == "table"]
+    assert len(tables) == 2
+    assert _wow_week_compare_table_element(
+        [{"metric": "m", "p1": "1", "p2": "2", "delta": "0"}],
+        element_id="t0",
+    )["freeze_first_column"]
 
 
 def test_build_adhoc_result_card_json_uses_wathet_header():
@@ -46,7 +135,11 @@ def test_build_adhoc_result_card_json_uses_wathet_header():
     )
     assert card["header"]["template"] == "wathet"
     body = card["body"]["elements"]
-    assert any(el.get("tag") == "markdown" and "查询结果" in el.get("content", "") for el in body)
+    assert any(el.get("tag") == "table" for el in body)
+    assert any(
+        el.get("tag") == "markdown" and "查询结果" in el.get("content", "")
+        for el in body
+    )
 
 
 def test_build_result_cards_json_routes_adhoc():

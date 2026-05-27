@@ -515,10 +515,49 @@ def _append_card_footer(
 def _section_header_md(sec: dict[str, Any]) -> str:
     label = sec.get("stage_label") or ""
     title = sec.get("title") or label
-    header = f"**{label}** {title}"
+    header = f"**{label} · {title}**" if label else f"**{title}**"
     if sec.get("summary"):
         header += f"\n{sec['summary']}"
     return header
+
+
+def _section_header_element(sec: dict[str, Any]) -> dict[str, Any]:
+    """Section title element with optional gain/loss background tint."""
+    title = str(sec.get("title") or "")
+    md = _section_header_md(sec)
+    if "涨幅贡献" in title:
+        return {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "green",
+            "horizontal_spacing": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "top",
+                    "elements": [{"tag": "markdown", "content": md}],
+                }
+            ],
+        }
+    if "跌幅贡献" in title:
+        return {
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "red",
+            "horizontal_spacing": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "vertical_align": "top",
+                    "elements": [{"tag": "markdown", "content": md}],
+                }
+            ],
+        }
+    return {"tag": "markdown", "content": md}
 
 
 def _notice_markdown_content(notice: dict[str, Any]) -> str:
@@ -574,7 +613,7 @@ def _build_pay_weekly_sec1_elements(
     used_chart_ids: set[str],
 ) -> list[dict[str, Any]]:
     elements: list[dict[str, Any]] = []
-    elements.append({"tag": "markdown", "content": _section_header_md(sec)})
+    elements.append(_section_header_element(sec))
     p1_rows = [r for r in daily_rows if r.get("period") in ("近一周", "P1")]
     p2_rows = [r for r in daily_rows if r.get("period") in ("前一周", "P2")]
     if p1_rows:
@@ -608,7 +647,7 @@ def _build_pay_weekly_sec2_element_groups(
 ) -> list[list[dict[str, Any]]]:
     """表3 + 周对比子图；图表超限时拆成多段元素列表（可对应多张卡片）。"""
     prefix: list[dict[str, Any]] = [
-        {"tag": "markdown", "content": _section_header_md(sec)},
+        _section_header_element(sec),
     ]
     chart_rows: list[dict[str, Any]] = []
     panel_spec: dict[str, Any] | None = None
@@ -866,6 +905,238 @@ def _decline_explore_block(facts: list[str]) -> str:
         return ""
     lines = [f"• {f}" for f in explore]
     return "**环比下降 · 自动探查**\n" + "\n".join(lines)
+
+
+# 飞书 JSON 2.0：单卡最多 5 个原生 table 组件
+_MAX_FEISHU_NATIVE_TABLES = 5
+_FEISHU_TABLE_PAGE_SIZE_MAX = 10
+
+
+def _feishu_table_element_id(seq: int) -> str:
+    eid = f"gdTbl{seq}"
+    return eid[:20]
+
+
+def _parse_adhoc_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    s = str(value).strip().replace(",", "").replace(" ", "")
+    if s in ("", "—", "-"):
+        return None
+    if s.endswith("%"):
+        return None
+    try:
+        return float(s.lstrip("+"))
+    except ValueError:
+        return None
+
+
+def _adhoc_column_def(col: dict[str, Any], *, is_first: bool) -> dict[str, Any]:
+    key = col.get("key") or ""
+    label = col.get("display_name") or col.get("label") or key
+    col_type = (col.get("type") or "string").lower()
+    width = "140px" if is_first else "auto"
+    if col_type == "number":
+        return {
+            "name": key,
+            "display_name": label,
+            "data_type": "number",
+            "width": width,
+            "horizontal_align": "right",
+            "format": {"separator": True, "precision": 2},
+        }
+    return {
+        "name": key,
+        "display_name": label,
+        "data_type": "text",
+        "width": width if is_first else "auto",
+        "vertical_align": "top",
+        "horizontal_align": "left",
+    }
+
+
+def _adhoc_row_native(
+    row: dict[str, Any], columns: list[dict[str, Any]]
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for col in columns:
+        key = col.get("key") or ""
+        col_type = (col.get("type") or "string").lower()
+        raw = row.get(key)
+        if col_type == "number":
+            num = _parse_adhoc_number(raw)
+            out[key] = num if num is not None else 0
+        elif raw is None:
+            out[key] = ""
+        else:
+            out[key] = str(raw)
+    return out
+
+
+def _adhoc_table_element(
+    table: dict[str, Any] | None,
+    *,
+    element_id: str,
+    max_rows: int = 40,
+    freeze_first_column: bool = True,
+) -> dict[str, Any] | None:
+    """飞书原生 table 组件（text/number 列，首列可冻结）。"""
+    if not table:
+        return None
+    cols = table.get("columns") or []
+    rows = table.get("rows") or []
+    if not rows:
+        return None
+    if not cols:
+        cols = [{"key": k, "label": k, "type": "string"} for k in rows[0].keys()]
+    feishu_cols = [
+        _adhoc_column_def(c, is_first=(i == 0)) for i, c in enumerate(cols)
+    ]
+    display = rows[:max_rows]
+    native_rows = [_adhoc_row_native(r, cols) for r in display]
+    page_size = max(1, min(_FEISHU_TABLE_PAGE_SIZE_MAX, len(native_rows)))
+    el: dict[str, Any] = {
+        "tag": "table",
+        "element_id": element_id,
+        "margin": "4px 0 8px 0",
+        "page_size": page_size,
+        "row_height": "auto",
+        "row_max_height": "80px",
+        "freeze_first_column": freeze_first_column and len(feishu_cols) > 1,
+        "header_style": {
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "grey",
+            "text_color": "default",
+            "bold": True,
+            "lines": 1,
+        },
+        "columns": feishu_cols,
+        "rows": native_rows,
+    }
+    return el
+
+
+def _wow_week_compare_table_element(
+    compare_rows: list[dict[str, Any]], *, element_id: str
+) -> dict[str, Any] | None:
+    if not compare_rows:
+        return None
+    cols = [
+        {
+            "name": "metric",
+            "display_name": "指标",
+            "data_type": "text",
+            "width": "auto",
+            "vertical_align": "top",
+        },
+        {
+            "name": "p1",
+            "display_name": "上上周",
+            "data_type": "text",
+            "width": "auto",
+            "horizontal_align": "right",
+        },
+        {
+            "name": "p2",
+            "display_name": "上一周",
+            "data_type": "text",
+            "width": "auto",
+            "horizontal_align": "right",
+        },
+        {
+            "name": "delta",
+            "display_name": "环比",
+            "data_type": "text",
+            "width": "auto",
+            "horizontal_align": "right",
+        },
+    ]
+    rows = [
+        {
+            "metric": str(r.get("metric") or ""),
+            "p1": str(r.get("p1") or ""),
+            "p2": str(r.get("p2") or ""),
+            "delta": str(r.get("delta") or ""),
+        }
+        for r in compare_rows
+    ]
+    return {
+        "tag": "table",
+        "element_id": element_id,
+        "margin": "4px 0 8px 0",
+        "page_size": max(1, min(_FEISHU_TABLE_PAGE_SIZE_MAX, len(rows))),
+        "row_height": "auto",
+        "freeze_first_column": True,
+        "header_style": {
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "grey",
+            "bold": True,
+        },
+        "columns": cols,
+        "rows": rows,
+    }
+
+
+def _append_native_table_or_markdown(
+    elements: list[dict[str, Any]],
+    *,
+    table: dict[str, Any] | None = None,
+    compare_rows: list[dict[str, Any]] | None = None,
+    heading: str | None = None,
+    table_seq: list[int],
+    native_budget: list[int],
+) -> None:
+    """优先原生 table；超出单卡 5 表上限时回退 Markdown。"""
+    if heading:
+        elements.append({"tag": "markdown", "content": f"**{heading}**"})
+    if compare_rows is not None:
+        if native_budget[0] > 0:
+            el = _wow_week_compare_table_element(
+                compare_rows, element_id=_feishu_table_element_id(table_seq[0])
+            )
+            if el:
+                elements.append(el)
+                table_seq[0] += 1
+                native_budget[0] -= 1
+                return
+        md = _wow_week_compare_table_md(compare_rows)
+        if md:
+            elements.append({"tag": "markdown", "content": md.strip()})
+        return
+    if not table:
+        return
+    if native_budget[0] > 0:
+        el = _adhoc_table_element(
+            table,
+            element_id=_feishu_table_element_id(table_seq[0]),
+            freeze_first_column=True,
+        )
+        if el:
+            elements.append(el)
+            table_seq[0] += 1
+            native_budget[0] -= 1
+            row_count = int(table.get("row_count") or len(table.get("rows") or []))
+            truncated = bool(table.get("truncated")) or row_count > len(el["rows"])
+            if truncated:
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "content": (
+                            f"<font color='grey'>共 {row_count} 行"
+                            f"（表格每页最多 {_FEISHU_TABLE_PAGE_SIZE_MAX} 行，可翻页查看）。</font>"
+                        ),
+                    }
+                )
+            return
+    table_md = _adhoc_table_markdown(table, heading=None)
+    if table_md:
+        elements.append({"tag": "markdown", "content": table_md})
+
+
 def _format_adhoc_cell(value: Any, col_type: str) -> str:
     if value is None:
         return "—"
@@ -885,19 +1156,46 @@ def _format_adhoc_cell(value: Any, col_type: str) -> str:
     return text
 
 
-def _adhoc_table_markdown(table: dict[str, Any] | None, *, max_rows: int = 40) -> str:
+def _wow_week_compare_table_md(compare_rows: list[dict[str, Any]]) -> str:
+    """双周流水对比表（上上周 vs 上一周）。"""
+    if not compare_rows:
+        return ""
+    lines = [
+        "",
+        "| 指标 | 上上周 | 上一周 | 环比 |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for r in compare_rows:
+        lines.append(
+            "| {metric} | {p1} | {p2} | {delta} |".format(
+                metric=r.get("metric") or "",
+                p1=r.get("p1") or "",
+                p2=r.get("p2") or "",
+                delta=r.get("delta") or "",
+            )
+        )
+    return "\n".join(lines)
+
+
+def _adhoc_table_markdown(
+    table: dict[str, Any] | None,
+    *,
+    max_rows: int = 40,
+    heading: str | None = None,
+) -> str:
     """Generic markdown table from platform answer.adhoc_table."""
     if not table:
         return ""
     cols = table.get("columns") or []
     rows = table.get("rows") or []
     if not rows:
-        return "**查询结果**\n<font color='grey'>无匹配行。</font>"
+        return f"**{heading or '查询结果'}**\n<font color='grey'>无匹配行。</font>"
     if not cols:
         cols = [{"key": k, "label": k, "type": "string"} for k in rows[0].keys()]
     headers = [c.get("label") or c.get("key") or "?" for c in cols]
+    title = heading or "查询结果"
     lines = [
-        "**查询结果**",
+        f"**{title}**",
         "<font color='grey'>按需 SQL 查询；下表为平台返回的原始行（最多展示 "
         f"{max_rows} 行）。</font>",
         "",
@@ -942,6 +1240,9 @@ def _adhoc_trace_block(answer: dict[str, Any], trace_id: str, template_id: str) 
 def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     """Feishu card for query_mode=adhoc (catalog.adhoc)."""
     answer = payload.get("answer") or {}
+    rendering = payload.get("rendering") or {}
+    preferred = rendering.get("preferred", "table")
+    charts = answer.get("charts") or []
     trace_id = payload.get("trace_id", "")
     session_id = payload.get("session_id", "")
     template_id = answer.get("template_id", "catalog.adhoc")
@@ -949,16 +1250,69 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     facts = answer.get("facts") or []
     facts_md = "\n".join(f"• {f}" for f in facts[:5])
 
+    chart_only = preferred == "chart" and charts and (charts[0].get("type") or "") == "pie"
+
     elements: list[dict[str, Any]] = [
         {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"},
     ]
     _append_answer_notices(elements, answer)
-    table_md = _adhoc_table_markdown(answer.get("adhoc_table"))
-    if table_md:
-        elements.append({"tag": "markdown", "content": table_md})
+    if charts:
+        _append_chart_blocks(
+            elements,
+            charts,
+            max_charts=3,
+            heading="**图表**",
+            trace_id=trace_id,
+        )
+    sections = answer.get("sections") or []
+    table_seq = [0]
+    native_budget = [_MAX_FEISHU_NATIVE_TABLES]
+    if not chart_only and sections:
+        for sec in sections:
+            title = sec.get("title") or (sec.get("stage_label") or "")
+            elements.append(_section_header_element(sec))
+            if sec.get("compare_rows"):
+                _append_native_table_or_markdown(
+                    elements,
+                    compare_rows=sec.get("compare_rows") or [],
+                    heading=None,
+                    table_seq=table_seq,
+                    native_budget=native_budget,
+                )
+            if sec.get("adhoc_table"):
+                _append_native_table_or_markdown(
+                    elements,
+                    table=sec.get("adhoc_table"),
+                    heading=title,
+                    table_seq=table_seq,
+                    native_budget=native_budget,
+                )
+            sec_charts = sec.get("charts") or []
+            if sec_charts:
+                _append_chart_blocks(
+                    elements,
+                    sec_charts,
+                    max_charts=1,
+                    heading=f"**{title} · 图表**",
+                    trace_id=trace_id,
+                )
+    elif not chart_only:
+        adhoc_tbl = answer.get("adhoc_table")
+        if adhoc_tbl:
+            _append_native_table_or_markdown(
+                elements,
+                table=adhoc_tbl,
+                heading="查询结果",
+                table_seq=table_seq,
+                native_budget=native_budget,
+            )
+        elif facts_md and not charts:
+            elements.append({"tag": "markdown", "content": f"**说明**\n{facts_md}"})
+        if facts_md and adhoc_tbl:
+            elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
     elif facts_md:
-        elements.append({"tag": "markdown", "content": f"**说明**\n{facts_md}"})
-    if facts_md and table_md:
+        elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
+    if facts_md and sections:
         elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
 
     rag_md = _lineage_rag_block(answer.get("rag_citations") or [])
