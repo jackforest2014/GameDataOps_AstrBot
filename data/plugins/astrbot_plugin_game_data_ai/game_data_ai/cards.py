@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
@@ -562,6 +563,105 @@ def _section_header_element(sec: dict[str, Any]) -> dict[str, Any]:
             ],
         }
     return {"tag": "markdown", "content": _section_header_md(sec)}
+
+
+# ---------------------------------------------------------------------------
+# Structured report renderer (answer.report → Feishu card elements)
+#
+# Backend (Go) emits a structured apiv1.Report; this block is the *only* place
+# that maps it to Feishu card JSON. It is deliberately self-contained and
+# data-driven (style tables below) so it can be lifted into the Go backend
+# wholesale if/when card assembly is migrated off AstrBot. See
+# docs/mvp/design/飞书文档问答-端到端流程与报告编排器设计.md §2.7.
+# ---------------------------------------------------------------------------
+
+# 同级标题同样式、不同级不同样式：一级深蓝底白字，二级灰底默认字。
+_REPORT_SECTION_STYLES: dict[int, dict[str, str | None]] = {
+    1: {"background_style": "blue", "text_color": "white"},
+    2: {"background_style": "grey", "text_color": None},
+}
+
+# bullet kind → 字色（与设计 2.7 配色一致）。
+_REPORT_BULLET_COLORS: dict[str, str | None] = {
+    "finding": "blue",
+    "hypothesis": "orange",
+    "to_verify": "grey",
+    "forecast": "purple",
+    "plain": None,
+}
+
+# 首行缩进两个全角空格。
+_REPORT_INDENT = "\u3000\u3000"
+
+_HEADING_PREFIX_RE = re.compile(r"^#{1,6}\s*")
+
+
+def _report_strip_heading(text: str) -> str:
+    """剥离 LLM 误带的 markdown 标题前缀，避免飞书把 ### 渲染成大字号。"""
+    return _HEADING_PREFIX_RE.sub("", text.strip())
+
+
+def _report_header_element(title: str, level: int) -> dict[str, Any]:
+    """整行背景色标题：column_set 单列 + background_style（客户端 ≥ 7.9）。"""
+    style = _REPORT_SECTION_STYLES.get(level, _REPORT_SECTION_STYLES[1])
+    text = f"**{title}**"
+    color = style.get("text_color")
+    if color:
+        text = f"<font color='{color}'>{text}</font>"
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "background_style": style.get("background_style") or "default",
+        "horizontal_spacing": "default",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [{"tag": "markdown", "content": text}],
+            }
+        ],
+    }
+
+
+def _report_paragraph_md(text: str) -> str:
+    return _REPORT_INDENT + _report_strip_heading(text)
+
+
+def _report_bullet_line(bullet: dict[str, Any]) -> str:
+    text = str(bullet.get("text") or "").strip()
+    color = _REPORT_BULLET_COLORS.get(str(bullet.get("kind") or "plain"))
+    if color:
+        return f"• <font color='{color}'>{text}</font>"
+    return f"• {text}"
+
+
+def _report_section_elements(section: dict[str, Any]) -> list[dict[str, Any]]:
+    elements: list[dict[str, Any]] = []
+    title = str(section.get("title") or "").strip()
+    level = int(section.get("level") or 1)
+    if title:
+        elements.append(_report_header_element(title, level))
+    paragraphs = [
+        _report_paragraph_md(p)
+        for p in (section.get("paragraphs") or [])
+        if str(p).strip()
+    ]
+    if paragraphs:
+        elements.append({"tag": "markdown", "content": "\n\n".join(paragraphs)})
+    bullets = section.get("bullets") or []
+    if bullets:
+        lines = "\n".join(_report_bullet_line(b) for b in bullets)
+        elements.append({"tag": "markdown", "content": lines})
+    return elements
+
+
+def _report_elements(report: dict[str, Any]) -> list[dict[str, Any]]:
+    elements: list[dict[str, Any]] = []
+    for section in report.get("sections") or []:
+        elements.extend(_report_section_elements(section))
+    return elements
 
 
 def _notice_markdown_content(notice: dict[str, Any]) -> str:
@@ -1419,10 +1519,36 @@ def log_card_build(
     )
 
 
+def build_report_card_json(payload: dict[str, Any]) -> dict[str, Any]:
+    """结构化报告卡片：按 answer.report 分章节渲染（标题整行背景色、字号一致）。"""
+    answer = payload.get("answer") or {}
+    report = answer.get("report") or {}
+    elements = _report_elements(report)
+    _append_card_footer(elements, payload, with_feedback=True)
+    card = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": answer.get("title", "分析报告")},
+            "subtitle": {
+                "tag": "plain_text",
+                "content": report.get("title") or "结构化分析报告",
+            },
+            "template": "blue",
+        },
+        "body": {"elements": elements},
+    }
+    log_card_build(payload, card, part=1, parts=1)
+    return card
+
+
 def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     answer = payload.get("answer") or {}
     if answer.get("query_mode") == "adhoc" or answer.get("adhoc_table"):
         return build_adhoc_result_card_json(payload)
+    report = answer.get("report") or {}
+    if report.get("sections"):
+        return build_report_card_json(payload)
     rendering = payload.get("rendering") or {}
     trace_id = payload.get("trace_id", "")
     session_id = payload.get("session_id", "")
