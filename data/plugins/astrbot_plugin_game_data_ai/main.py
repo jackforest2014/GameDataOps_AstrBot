@@ -409,6 +409,20 @@ class GameDataAIPlugin(star.Star):
             )
             return
 
+        if event_type == "document.kg.candidates":
+            candidates = data.get("candidates") or []
+            if not candidates:
+                return
+            trace_id = str(data.get("trace_id") or "")
+            chat_id = self._user_last_chat.get(feishu_user_id, feishu_user_id)
+            sess = self._doc_sessions.get(trace_id)
+            if sess:
+                chat_id = sess["chat_id"]
+            from game_data_ai.kg_candidate_card import build_kg_candidate_card
+
+            await self._send_card_from_action(None, build_kg_candidate_card(data), chat_id)
+            return
+
         if event_type == "document.verification.result":
             cards = data.get("cards") or []
             if not cards:

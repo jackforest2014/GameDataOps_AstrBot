@@ -74,6 +74,10 @@ def register_feedback_card_handler(
             )
             return None
 
+        if action in ("kg_approve", "kg_reject"):
+            await _handle_kg_decision(client, event, value, feishu_user_id, chat_id)
+            return None
+
         if action in (
             "schedule_cancel_confirm",
             "schedule_cancel_abort",
@@ -116,6 +120,39 @@ async def _handle_ingest_decision(
         )
     except Exception as e:
         logger.error(f"[game_data_ai] ingest.decision failed: {e}", exc_info=True)
+
+
+async def _handle_kg_decision(
+    client: GameDataAIClient,
+    event: P2CardActionTrigger,
+    value: dict[str, Any],
+    feishu_user_id: str,
+    chat_id: str,
+) -> None:
+    entity_id = value.get("entity_id", "")
+    edge_id = value.get("edge_id", "")
+    decision = "approve" if value.get("action") == "kg_approve" else "reject"
+    msg_id = ""
+    try:
+        ctx = event.event.context if event.event else None
+        msg_id = getattr(ctx, "open_message_id", None) or f"kg_{entity_id[:12]}"
+    except Exception:
+        msg_id = f"kg_{entity_id[:12]}"
+    try:
+        resp = await client.kg_decision(
+            feishu_user_id=feishu_user_id,
+            feishu_chat_id=chat_id,
+            feishu_message_id=msg_id,
+            entity_id=entity_id,
+            edge_id=edge_id,
+            decision=decision,
+        )
+        logger.info(
+            f"[game_data_ai] kg.decision entity={entity_id} edge={edge_id} "
+            f"decision={decision} resp={resp}"
+        )
+    except Exception as e:
+        logger.error(f"[game_data_ai] kg.decision failed: {e}", exc_info=True)
 
 
 async def _handle_feedback(

@@ -213,6 +213,30 @@ class GameDataAIClient:
             timeout_sec=30,
         )
 
+    async def kg_decision(
+        self,
+        *,
+        feishu_user_id: str,
+        feishu_chat_id: str,
+        feishu_message_id: str,
+        entity_id: str,
+        edge_id: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        return await self._post_json(
+            "/api/v1/kg/decision",
+            {
+                "feishu_user_id": feishu_user_id,
+                "entity_id": entity_id,
+                "edge_id": edge_id,
+                "decision": decision,
+            },
+            feishu_user_id=feishu_user_id,
+            feishu_chat_id=feishu_chat_id,
+            feishu_message_id=feishu_message_id,
+            timeout_sec=30,
+        )
+
     async def create_schedule(
         self,
         *,
