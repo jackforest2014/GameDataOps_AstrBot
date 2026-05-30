@@ -409,6 +409,21 @@ class GameDataAIPlugin(star.Star):
             )
             return
 
+        if event_type == "document.verification.result":
+            cards = data.get("cards") or []
+            if not cards:
+                return
+            trace_id = str(data.get("trace_id") or "")
+            chat_id = self._user_last_chat.get(feishu_user_id, feishu_user_id)
+            sess = self._doc_sessions.get(trace_id)
+            if sess:
+                chat_id = sess["chat_id"]
+            from game_data_ai.cards import build_verification_cards_json
+
+            card = build_verification_cards_json(data)
+            await self._send_card_from_action(None, card, chat_id)
+            return
+
         if event_type == "document.auth_required":
             auth_url = self.client.abs_url(str(data.get("auth_url") or ""))
             chat_id = self._user_last_chat.get(feishu_user_id, feishu_user_id)

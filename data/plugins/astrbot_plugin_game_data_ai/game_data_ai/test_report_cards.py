@@ -7,6 +7,7 @@ from game_data_ai.cards import (
     _report_paragraph_md,
     build_report_card_json,
     build_result_cards_json,
+    build_verification_cards_json,
 )
 
 
@@ -84,3 +85,78 @@ def test_build_report_card_direct_entry():
     card = build_report_card_json(_sample_payload())
     assert card["schema"] == "2.0"
     assert any(e["tag"] == "column_set" for e in card["body"]["elements"])
+
+
+def test_bullet_source_doc_fact_keeps_kind_color_with_tag():
+    line = _report_bullet_line(
+        {"kind": "finding", "source": "doc_fact", "text": "发现：版本空窗"}
+    )
+    assert "[事实]" in line
+    assert "blue" in line  # 事实保留 kind 配色
+
+
+def test_bullet_source_inference_is_weakened_grey():
+    line = _report_bullet_line(
+        {"kind": "finding", "source": "inference", "text": "可能由空窗导致"}
+    )
+    assert "[推断]" in line
+    # 推断弱化为灰字，且不得保留 finding 的蓝色
+    assert "grey" in line and "blue" not in line
+
+
+def test_bullet_source_model_prior_is_weakened_grey():
+    line = _report_bullet_line(
+        {"kind": "forecast", "source": "model_prior", "text": "通常会回升"}
+    )
+    assert "[经验]" in line
+    assert "grey" in line and "purple" not in line
+
+
+def test_bullet_no_source_falls_back_to_kind_color():
+    # 未标注 source 时保持旧行为（与 test_bullet_kind_colors 一致）。
+    assert "blue" in _report_bullet_line({"kind": "finding", "text": "x"})
+    assert _report_bullet_line({"kind": "plain", "text": "z"}) == "• z"
+
+
+def _verification_payload() -> dict:
+    return {
+        "trace_id": "tr_v",
+        "cards": [
+            {
+                "question": "活动期 ARPPU 是否低于空窗期？",
+                "verdict": "confirmed",
+                "evidence": "P1 ARPPU 312 < P2 358（-12.8%）",
+                "caliber": "高付费用户按计费点聚合",
+                "sql_digest": "abc123",
+            },
+            {
+                "question": "复购率是否按计费点下滑？",
+                "verdict": "unverifiable",
+                "need_fields": ["billing_point_id"],
+            },
+            {
+                "question": "付费人数是否减少？",
+                "verdict": "listed",
+            },
+        ],
+    }
+
+
+def test_verification_card_renders_each_verdict_badge():
+    card = build_verification_cards_json(_verification_payload())
+    assert card["schema"] == "2.0"
+    body = "\n".join(
+        e.get("content", "")
+        for e in card["body"]["elements"]
+        if e.get("tag") == "markdown"
+    )
+    assert "已证实" in body and "green" in body
+    assert "暂无法验证" in body and "billing_point_id" in body
+    assert "待验证" in body
+    assert "trace `tr_v`" in body
+
+
+def test_verification_card_empty_cards_still_valid():
+    card = build_verification_cards_json({"trace_id": "t0", "cards": []})
+    assert card["schema"] == "2.0"
+    assert card["header"]["title"]["content"] == "结论自验证"

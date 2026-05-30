@@ -590,6 +590,16 @@ _REPORT_BULLET_COLORS: dict[str, str | None] = {
     "plain": None,
 }
 
+# bullet source（来源分级，见 docs/mvp/design/19 与 apiv1.ReportBullet.Source）：
+# 事实有数仓/文档支撑，保留 kind 配色；推断/经验为模型生成，统一弱化为灰字并加来源前缀，
+# 避免与「事实」在卡片里争夺同等视觉权重（T0.4）。
+_REPORT_SOURCE_TAGS: dict[str, str] = {
+    "doc_fact": "事实",
+    "inference": "推断",
+    "model_prior": "经验",
+}
+_REPORT_WEAKENED_SOURCES: frozenset[str] = frozenset({"inference", "model_prior"})
+
 # 首行缩进两个全角空格。
 _REPORT_INDENT = "\u3000\u3000"
 
@@ -631,10 +641,16 @@ def _report_paragraph_md(text: str) -> str:
 
 def _report_bullet_line(bullet: dict[str, Any]) -> str:
     text = str(bullet.get("text") or "").strip()
+    source = str(bullet.get("source") or "")
+    tag = _REPORT_SOURCE_TAGS.get(source)
+    prefix = f"<font color='grey'>[{tag}]</font> " if tag else ""
+    # 推断/经验：整体灰字弱化（不论 kind 配色），保留来源前缀以便分析师快速判断可信度。
+    if source in _REPORT_WEAKENED_SOURCES:
+        return f"• {prefix}<font color='grey'>{text}</font>"
     color = _REPORT_BULLET_COLORS.get(str(bullet.get("kind") or "plain"))
     if color:
-        return f"• <font color='{color}'>{text}</font>"
-    return f"• {text}"
+        return f"• {prefix}<font color='{color}'>{text}</font>"
+    return f"• {prefix}{text}"
 
 
 def _report_section_elements(section: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1540,6 +1556,72 @@ def build_report_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     }
     log_card_build(payload, card, part=1, parts=1)
     return card
+
+
+# ---------------------------------------------------------------------------
+# Self-verification cards (SSE: document.verification.result)
+# Backend emits apiv1.VerificationCard[]; one追发卡片汇总每条假设的回算结论。
+# See docs/mvp/design/19-自验证闭环归因-方案设计.md.
+# ---------------------------------------------------------------------------
+
+# verdict → (徽标文案, 字色)
+_VERDICT_BADGES: dict[str, tuple[str, str]] = {
+    "confirmed": ("✅ 已证实", "green"),
+    "refuted": ("❌ 已证伪", "red"),
+    "inconclusive": ("➖ 数据不确定", "grey"),
+    "unverifiable": ("⚠️ 暂无法验证", "grey"),
+    "listed": ("🕓 待验证（超预算未执行）", "grey"),
+}
+
+
+def _verification_item_md(card: dict[str, Any]) -> str:
+    verdict = str(card.get("verdict") or "listed")
+    label, color = _VERDICT_BADGES.get(verdict, _VERDICT_BADGES["listed"])
+    question = str(card.get("question") or "").strip()
+    lines = [f"<font color='{color}'>**{label}**</font> {question}"]
+    evidence = str(card.get("evidence") or "").strip()
+    if evidence:
+        lines.append(f"<font color='grey'>证据：{evidence}</font>")
+    caliber = str(card.get("caliber") or "").strip()
+    if caliber:
+        lines.append(f"<font color='grey'>口径：{caliber}</font>")
+    need_fields = [str(x) for x in (card.get("need_fields") or []) if str(x).strip()]
+    if need_fields:
+        lines.append(f"<font color='grey'>需补字段：{', '.join(need_fields)}</font>")
+    digest = str(card.get("sql_digest") or "").strip()
+    if digest:
+        lines.append(f"<font color='grey'>SQL digest `{digest}`</font>")
+    return "\n".join(lines)
+
+
+def build_verification_cards_json(payload: dict[str, Any]) -> dict[str, Any]:
+    """结论自验证追发卡片：汇总每条可核假设的数仓回算结论（SSE 追发）。"""
+    cards = payload.get("cards") or []
+    trace_id = str(payload.get("trace_id") or "")
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                "<font color='grey'>以下为系统对上文结论中可核假设的自动验证："
+                "用真实数仓数据回算，结论独立于上文文字。</font>"
+            ),
+        }
+    ]
+    for i, card in enumerate(cards):
+        if i:
+            elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": _verification_item_md(card)})
+    if trace_id:
+        elements.append({"tag": "hr"})
+        elements.append(
+            {"tag": "markdown", "content": f"<font color='grey'>trace `{trace_id}`</font>"}
+        )
+    return _make_feishu_card(
+        title="结论自验证",
+        subtitle="闭环归因 · 数仓回算",
+        elements=elements,
+        template="turquoise",
+    )
 
 
 def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
