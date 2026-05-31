@@ -1641,11 +1641,17 @@ _VERDICT_BADGES: dict[str, tuple[str, str]] = {
 def _verification_item_md(card: dict[str, Any]) -> str:
     verdict = str(card.get("verdict") or "listed")
     label, color = _VERDICT_BADGES.get(verdict, _VERDICT_BADGES["listed"])
+    hypothesis = str(card.get("hypothesis") or "").strip()
     question = str(card.get("question") or "").strip()
-    lines = [f"<font color='{color}'>**{label}**</font> {question}"]
+    # 首行明确"在验证哪条假设"，与上文「建议核对的数据」呼应（#4a）。
+    head = hypothesis or question
+    lines = [f"<font color='{color}'>**{label}**</font> **验证假设：**{head}"]
+    # 当有独立的假设原文时，把实际查询做法另起一行，说清这条在解决什么（#4b）。
+    if hypothesis and question and question != hypothesis:
+        lines.append(f"<font color='grey'>验证做法：{question}</font>")
     evidence = str(card.get("evidence") or "").strip()
     if evidence:
-        lines.append(f"<font color='grey'>证据：{evidence}</font>")
+        lines.append(f"<font color='grey'>证据数据：{evidence}</font>")
     caliber = str(card.get("caliber") or "").strip()
     if caliber:
         lines.append(f"<font color='grey'>口径：{caliber}</font>")
@@ -1666,8 +1672,9 @@ def build_verification_cards_json(payload: dict[str, Any]) -> dict[str, Any]:
         {
             "tag": "markdown",
             "content": (
-                "<font color='grey'>以下为系统对上文结论中可核假设的自动验证："
-                "用真实数仓数据回算，结论独立于上文文字。</font>"
+                "<font color='grey'>承接上文「建议核对的数据」：系统用真实数仓数据，"
+                "对结论中每条可核假设做了自动回算。下列结论独立于上文文字，"
+                "可据「证据数据」自行复核。</font>"
             ),
         }
     ]

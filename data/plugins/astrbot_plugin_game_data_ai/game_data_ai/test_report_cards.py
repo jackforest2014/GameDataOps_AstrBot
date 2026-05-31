@@ -246,6 +246,31 @@ def test_verification_card_renders_each_verdict_badge():
     assert "trace `tr_v`" in body
 
 
+def test_verification_card_leads_with_hypothesis_and_query():
+    payload = {
+        "trace_id": "tr_h",
+        "cards": [
+            {
+                "hypothesis": "5 月下旬付费下滑由龙祖付费点疲劳导致",
+                "question": "对比两期龙祖礼包收入贡献变化",
+                "verdict": "inconclusive",
+                "evidence": "本期 9,766,102 vs 上期 9,123,455（+7.0%）",
+                "caliber": "按计费点聚合两期收入",
+                "sql_digest": "abc",
+            }
+        ],
+    }
+    body = "\n".join(
+        e.get("content", "")
+        for e in build_verification_cards_json(payload)["body"]["elements"]
+        if e.get("tag") == "markdown"
+    )
+    assert "**验证假设：**5 月下旬付费下滑由龙祖付费点疲劳导致" in body
+    assert "验证做法：对比两期龙祖礼包收入贡献变化" in body
+    assert "证据数据：本期 9,766,102" in body
+    assert "建议核对的数据" in body  # 引导语与上文呼应
+
+
 def test_verification_card_empty_cards_still_valid():
     card = build_verification_cards_json({"trace_id": "t0", "cards": []})
     assert card["schema"] == "2.0"
