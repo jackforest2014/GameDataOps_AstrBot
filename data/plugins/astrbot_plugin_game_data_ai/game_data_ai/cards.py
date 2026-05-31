@@ -663,24 +663,26 @@ def _strip_md_bold(text: str) -> str:
     return _MD_BOLD_RE.sub(r"\1", text)
 
 
-def _report_bullet_line(bullet: dict[str, Any]) -> str:
+def _report_bullet_line(bullet: dict[str, Any], *, check_idx: int = 0) -> str:
     raw_text = str(bullet.get("text") or "").strip()
     source = str(bullet.get("source") or "")
     kind = str(bullet.get("kind") or "plain")
     tag = _REPORT_SOURCE_TAGS.get(source)
     # 来源小标签：加粗放在 <font> 外面（飞书 markdown 不支持 ** 嵌套在 <font> 内）。
     tag_prefix = f"**[{tag}]** " if tag else ""
+    # to_verify 条目：加序号使其与「结论自验证」卡片中的 check_index 形成显式对应。
+    idx_prefix = f"**{check_idx}.** " if check_idx > 0 else ""
     # 推断/经验：整体灰字弱化；先剥去 LLM 自带的 ** 号，否则 <font> 内 ** 渲染成字面量。
     if source in _REPORT_WEAKENED_SOURCES:
         clean = _strip_md_bold(raw_text)
-        return f"• {tag_prefix}<font color='grey'>{clean}</font>"
+        return f"• {idx_prefix}{tag_prefix}<font color='grey'>{clean}</font>"
     color = _REPORT_BULLET_COLORS.get(kind)
     if color:
         # 有颜色：同样不能在 <font> 内用 **，剥去后以颜色区分。
         clean = _strip_md_bold(raw_text)
-        return f"• {tag_prefix}<font color='{color}'>{clean}</font>"
-    # 无颜色包裹（plain kind）：可安全加粗条目前缀。
-    return f"• {tag_prefix}{_bold_lead_prefix(raw_text)}"
+        return f"• {idx_prefix}{tag_prefix}<font color='{color}'>{clean}</font>"
+    # 无颜色包裹（plain kind / to_verify）：可安全加粗条目前缀。
+    return f"• {idx_prefix}{tag_prefix}{_bold_lead_prefix(raw_text)}"
 
 
 def _is_report_group_start(bullet: dict[str, Any]) -> bool:
@@ -691,12 +693,19 @@ def _is_report_group_start(bullet: dict[str, Any]) -> bool:
 
 
 def _grouped_bullet_lines(bullets: list[dict[str, Any]]) -> list[str]:
-    """渲染 bullet，并在不同分组之间插入空行，避免密密麻麻一整块。"""
+    """渲染 bullet，并在不同分组之间插入空行，避免密密麻麻一整块。
+    to_verify 类条目额外加序号，以便与「结论自验证」卡片中的 check_index 对应。
+    """
     lines: list[str] = []
+    to_verify_idx = 0
     for i, b in enumerate(bullets):
         if i > 0 and _is_report_group_start(b):
             lines.append("")  # 组间空行
-        lines.append(_report_bullet_line(b))
+        if str(b.get("kind") or "") == "to_verify":
+            to_verify_idx += 1
+            lines.append(_report_bullet_line(b, check_idx=to_verify_idx))
+        else:
+            lines.append(_report_bullet_line(b))
     return lines
 
 
@@ -1682,21 +1691,39 @@ _VERDICT_BADGES: dict[str, tuple[str, str]] = {
 }
 
 
+_GW_ENCODING_ERR_RE = re.compile(r"unsupported format character", re.IGNORECASE)
+_GW_RAW_ERR_RE = re.compile(r"[：:]\s*8380 error:.*", re.DOTALL)
+
+
+def _clean_caliber(caliber: str) -> str:
+    """将网关原始错误消息（JSON blob）替换为对用户可读的说明。"""
+    if not caliber.startswith("执行失败"):
+        return caliber
+    if _GW_ENCODING_ERR_RE.search(caliber):
+        return "执行失败：查询含特殊字符（中文 LIKE 条件），数据网关暂不支持；可手动从文档查找相关活动配置"
+    # 去除 8380 error: {...} 原始 JSON，保留前缀说明
+    cleaned = _GW_RAW_ERR_RE.sub("：数据网关返回错误，无法执行此查询", caliber, count=1)
+    return cleaned
+
+
 def _verification_item_md(card: dict[str, Any]) -> str:
     verdict = str(card.get("verdict") or "listed")
     label, color = _VERDICT_BADGES.get(verdict, _VERDICT_BADGES["listed"])
     hypothesis = str(card.get("hypothesis") or "").strip()
     question = str(card.get("question") or "").strip()
-    # 首行明确"在验证哪条假设"，与上文「建议核对的数据」呼应（#4a）。
+    check_index = int(card.get("check_index") or 0)
+    # 序号引用：与上文「建议核对的数据」中同编号条目显式呼应。
+    idx_ref = f"**{check_index}.** " if check_index > 0 else ""
+    # 首行：序号 + 判定徽章 + 假设摘要
     head = hypothesis or question
-    lines = [f"<font color='{color}'>**{label}**</font> **验证假设：**{head}"]
-    # 当有独立的假设原文时，把实际查询做法另起一行，说清这条在解决什么（#4b）。
+    lines = [f"{idx_ref}<font color='{color}'>**{label}**</font> **验证假设：**{head}"]
+    # 当有独立的假设原文时，把实际查询做法另起一行
     if hypothesis and question and question != hypothesis:
         lines.append(f"<font color='grey'>验证做法：{question}</font>")
     evidence = str(card.get("evidence") or "").strip()
     if evidence:
         lines.append(f"<font color='grey'>证据数据：{evidence}</font>")
-    caliber = str(card.get("caliber") or "").strip()
+    caliber = _clean_caliber(str(card.get("caliber") or "").strip())
     if caliber:
         lines.append(f"<font color='grey'>口径：{caliber}</font>")
     need_fields = [str(x) for x in (card.get("need_fields") or []) if str(x).strip()]
@@ -1717,7 +1744,8 @@ def build_verification_cards_json(payload: dict[str, Any]) -> dict[str, Any]:
             "tag": "markdown",
             "content": (
                 "<font color='grey'>承接上文「建议核对的数据」：系统用真实数仓数据，"
-                "对结论中每条可核假设做了自动回算。下列结论独立于上文文字，"
+                "对结论中每条可核假设做了自动回算。"
+                "**下列各条编号与上文「建议核对的数据」序号一一对应**，"
                 "可据「证据数据」自行复核。</font>"
             ),
         }

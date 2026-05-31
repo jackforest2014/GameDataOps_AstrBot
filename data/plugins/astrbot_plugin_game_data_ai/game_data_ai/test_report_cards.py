@@ -334,3 +334,67 @@ def test_no_literal_closing_font_tag_in_source_prefix():
         assert "**</font>" not in line and "</font>**" not in line, (
             f"来源前缀含非法 </font>: {line!r}"
         )
+
+
+# --- 交叉引用：to_verify 编号 + check_index -----------------------------------
+
+
+from game_data_ai.cards import _grouped_bullet_lines, _clean_caliber  # noqa: E402
+
+
+def test_to_verify_bullets_are_numbered():
+    """to_verify 条目应加序号（**1.** / **2.**），普通条目不加。"""
+    bullets = [
+        {"kind": "finding", "text": "普通发现"},
+        {"kind": "to_verify", "text": "需要核对 A 指标"},
+        {"kind": "to_verify", "text": "需要核对 B 指标"},
+    ]
+    lines = _grouped_bullet_lines(bullets)
+    assert "**1.**" in lines[1], f"第一条 to_verify 应有序号 **1.**: {lines[1]!r}"
+    assert "**2.**" in lines[2], f"第二条 to_verify 应有序号 **2.**: {lines[2]!r}"
+    assert "**1.**" not in lines[0], f"普通 finding 不应有序号: {lines[0]!r}"
+
+
+def test_verification_item_check_index_prefix():
+    """check_index 字段应渲染为序号前缀，与 to_verify 编号对应。"""
+    payload = {
+        "trace_id": "",
+        "cards": [
+            {
+                "hypothesis": "5 月下旬付费下滑由版本空窗导致",
+                "question": "对比两期付费金额",
+                "verdict": "inconclusive",
+                "check_index": 2,
+            }
+        ],
+    }
+    body = "\n".join(
+        e.get("content", "")
+        for e in build_verification_cards_json(payload)["body"]["elements"]
+        if e.get("tag") == "markdown"
+    )
+    assert "**2.**" in body, f"check_index=2 应在卡片中渲染为 **2.**: {body!r}"
+    assert "**验证假设：**5 月下旬付费下滑由版本空窗导致" in body
+
+
+def test_clean_caliber_encoding_error():
+    """中文 LIKE 导致的编码错误应替换为可读说明，不暴露原始 JSON blob。"""
+    raw = "执行失败：8380 error: {\"detail\": \"unsupported format character '?' (0x3f) at index 10\"}"
+    cleaned = _clean_caliber(raw)
+    assert "8380 error" not in cleaned
+    assert "中文 LIKE" in cleaned or "特殊字符" in cleaned
+
+
+def test_clean_caliber_generic_gateway_error():
+    """其他网关错误也应简化，不暴露 8380 error JSON。"""
+    # Go 侧拼接格式：「执行失败：」+ runErr.Error()，冒号为全角「：」
+    raw = "执行失败：8380 error: {\"detail\": \"connection timeout\"}"
+    cleaned = _clean_caliber(raw)
+    assert "8380 error" not in cleaned, f"原始 8380 error 应被清理: {cleaned!r}"
+    assert "数据网关" in cleaned
+
+
+def test_clean_caliber_normal_text_unchanged():
+    """正常口径文本不应被修改。"""
+    raw = "按计费点聚合两期收入"
+    assert _clean_caliber(raw) == raw
