@@ -124,12 +124,26 @@ def test_bullet_no_source_falls_back_to_kind_color():
 # --- A2: 排版（小标签加粗、分组空行、概述首句+列表） ----------------------
 
 
-def test_bullet_tag_and_lead_prefix_are_bold():
+def test_bullet_tag_is_bold_outside_font():
+    """来源标签必须用 ** 加粗且位于 <font> 标签之外。
+    飞书 markdown 不支持 ** 嵌套在 <font> 内（会渲染成字面量 ** 和裸 </font>）。
+    """
     line = _report_bullet_line(
         {"kind": "finding", "source": "doc_fact", "text": "发现：版本空窗"}
     )
     assert "**[事实]**" in line  # 来源标签加粗
-    assert "**发现：**" in line  # 条目前缀加粗
+    # 有颜色包裹时，条目前缀不再加粗（** 在 <font> 内无效），剥除后才能正确渲染。
+    assert "**发现：**" not in line
+    # 不得出现 ** 嵌套在 <font> 标签内——飞书会把 </font> 渲染为字面量。
+    assert "</font>**" not in line and "**</font>" not in line
+
+def test_bullet_no_bold_inside_font():
+    """LLM 生成的 ** 加粗也应被剥除，避免 <font> 内出现 ** 字面量。"""
+    line = _report_bullet_line(
+        {"kind": "finding", "source": "inference", "text": "可能由**空窗期**导致"}
+    )
+    assert "**空窗期**" not in line  # ** 被剥除
+    assert "空窗期" in line          # 内容保留
 
 
 def test_group_blank_line_between_finding_groups():
@@ -275,3 +289,48 @@ def test_verification_card_empty_cards_still_valid():
     card = build_verification_cards_json({"trace_id": "t0", "cards": []})
     assert card["schema"] == "2.0"
     assert card["header"]["title"]["content"] == "结论自验证"
+
+
+# --- 飞书 markdown 视觉契约（Rendering contract） ----------------------------
+# 飞书 markdown 不允许 ** 嵌套在 <font> 标签内，否则 </font> 会作为字面量出现，
+# ** 也不加粗。以下测试通过检查典型输出来保证生成代码不违反此约束。
+
+
+import re as _re
+
+_FONT_TAG_RE = _re.compile(r"<font[^>]*>(.*?)</font>", _re.DOTALL)
+
+
+def _has_bold_inside_font(text: str) -> bool:
+    """检查 <font> 标签内是否存在 ** 加粗标记——如存在则飞书渲染会出错。"""
+    for m in _FONT_TAG_RE.finditer(text):
+        if "**" in m.group(1):
+            return True
+    return False
+
+
+def test_no_bold_inside_font_for_typical_bullets():
+    """关键渲染契约：任何 bullet 输出都不能在 <font> 内出现 ** 号。"""
+    cases = [
+        {"kind": "finding", "source": "doc_fact", "text": "发现：**版本空窗期**是主因"},
+        {"kind": "hypothesis", "source": "inference", "text": "假设：**付费率**下滑"},
+        {"kind": "forecast", "source": "model_prior", "text": "预判：**下月**回升"},
+        {"kind": "finding", "text": "发现：无来源标注"},
+        {"kind": "plain", "text": "普通说明"},
+    ]
+    for c in cases:
+        line = _report_bullet_line(c)
+        assert not _has_bold_inside_font(line), (
+            f"bullet 输出在 <font> 内含 **（飞书渲染会出错）:\n  input={c}\n  output={line!r}"
+        )
+
+
+def test_no_literal_closing_font_tag_in_source_prefix():
+    """来源标签前缀（[事实]/[推断]）不得出现 </font> 字面量。"""
+    for source, _ in [("doc_fact", "finding"), ("inference", "hypothesis")]:
+        line = _report_bullet_line({"kind": "finding", "source": source, "text": "x"})
+        # 合法：<font color='grey'>[事实]</font> 或 **[事实]**（两种都行）
+        # 非法：出现裸 </font> 在 ** 旁边（如 **[事实]**</font>）
+        assert "**</font>" not in line and "</font>**" not in line, (
+            f"来源前缀含非法 </font>: {line!r}"
+        )

@@ -72,6 +72,28 @@ def _make_chart_element(
     return el
 
 
+def _pie_values_from_spec(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """双周计费点饼图：data_rows 携带完整名称与涨跌副标题（供外侧连线标签）。"""
+    rows = spec.get("data_rows") or []
+    if not rows:
+        return []
+    values: list[dict[str, Any]] = []
+    for r in rows:
+        name = str(r.get("label") or "").strip()
+        if not name:
+            continue
+        detail = str(r.get("metric") or "").strip()
+        val = round(float(r.get("value") or 0), 2)
+        label_text = f"{name}\n{detail}" if detail else name
+        values.append({"label": name, "value": val, "labelText": label_text})
+    return values
+
+
+def _is_wow_billing_pie(spec: dict[str, Any]) -> bool:
+    cid = str(spec.get("chart_id") or "")
+    return cid.startswith("wow_") and (spec.get("type") or "") == "pie"
+
+
 def _chart_values_from_spec(spec: dict[str, Any]) -> list[dict[str, Any]]:
     labels = spec.get("labels") or []
     datasets = spec.get("datasets") or []
@@ -327,14 +349,17 @@ def week_compare_panel_elements(
 def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None = None) -> dict[str, Any] | None:
     labels = spec.get("labels") or []
     datasets = spec.get("datasets") or []
-    if not labels and not datasets:
+    data_rows = spec.get("data_rows") or []
+    if not labels and not datasets and not data_rows:
         return None
-    values = _chart_values_from_spec(spec)
-    if not values:
-        return None
-
     chart_id = str(spec.get("chart_id") or "")
     chart_type = spec.get("type") or "bar"
+    if chart_type == "pie" and spec.get("data_rows"):
+        values = _pie_values_from_spec(spec)
+    else:
+        values = _chart_values_from_spec(spec)
+    if not values:
+        return None
     title = spec.get("title") or ""
     x_field = spec.get("x_field") or "label"
     y_field = spec.get("y_field") or "value"
@@ -346,8 +371,66 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
     if multi_series:
         y_name = "数值"
 
+    if chart_type == "pie":
+        category_field = x_field or "label"
+        wow_pie = _is_wow_billing_pie(spec)
+        chart_body: dict[str, Any] = {
+            "type": "pie",
+            "media": [],
+            "title": {"text": title, "textStyle": {"fontSize": 12}},
+            "data": {"values": values},
+            "valueField": y_field,
+            "categoryField": category_field,
+            "outerRadius": 0.78 if wow_pie else 0.9,
+            "padding": (
+                {"top": 20, "bottom": 20, "left": 12, "right": 12}
+                if wow_pie
+                else {"top": 8, "bottom": 8, "left": 8, "right": 8}
+            ),
+            "label": (
+                {
+                    "visible": True,
+                    "position": "outside",
+                    "field": "labelText",
+                    "style": {"fontSize": 9, "lineHeight": 13},
+                    "line": {"visible": True},
+                }
+                if wow_pie
+                else {"visible": True}
+            ),
+            "legends": (
+                {"visible": False}
+                if wow_pie
+                else {
+                    "visible": True,
+                    "orient": "right",
+                    "position": "end",
+                    "maxRow": 2,
+                }
+            ),
+        }
+        n_slices = len(values)
+        if wow_pie:
+            height_px = min(520, 300 + max(0, n_slices - 6) * 14)
+            aspect_ratio = "4:3"
+            margin = "4px 0"
+        else:
+            height_px = min(360, 200 + max(0, n_slices - 8) * 8)
+            aspect_ratio = "1:1"
+            margin = "8px 4px"
+        return _make_chart_element(
+            chart_body,
+            element_id=element_id or chart_id or "gd_pie",
+            height_px=height_px,
+            aspect_ratio=aspect_ratio,
+            margin=margin,
+        )
+
     is_line = chart_type == "line"
-    use_horizontal = chart_type == "bar" and not multi_series
+    # "vertical" direction → column chart (x=categories, y=values).
+    # Default for single-series bar is horizontal; multi-series stays vertical.
+    force_vertical = spec.get("direction") == "vertical"
+    use_horizontal = chart_type == "bar" and not multi_series and not force_vertical
     is_daily_revenue = chart_id in ("p1_revenue_bar", "p2_revenue_bar")
     is_daily_trend_line = is_daily_revenue and is_line
 
@@ -448,6 +531,28 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
                 "textStyle": {"fontSize": 11},
                 "padding": {"bottom": 0},
             }
+    elif force_vertical:
+        # 竖直双柱比较图（上期 vs 本期），x=类目，y=数值。
+        n_bars = len(labels) if labels else len(values)
+        chart_body["xField"] = x_field
+        chart_body["yField"] = y_field
+        chart_body["barMaxWidth"] = 48
+        chart_body["padding"] = {"top": 20, "bottom": 40, "left": 52, "right": 12}
+        chart_body["axes"] = [
+            {
+                "orient": "left",
+                "title": {"visible": True, "text": y_name, "textStyle": {"fontSize": 10}},
+                "label": {"style": {"fontSize": 10}},
+            },
+            {
+                "orient": "bottom",
+                "title": {"visible": False},
+                "label": {"style": {"fontSize": 10}, "autoRotate": False},
+            },
+        ]
+        # 紧凑高度：嵌入 要点 旁边，不占太多空间
+        height_px = 160 + max(0, n_bars - 2) * 20
+        margin = "4px 0"
     else:
         chart_body["xField"] = x_field
         chart_body["yField"] = y_field

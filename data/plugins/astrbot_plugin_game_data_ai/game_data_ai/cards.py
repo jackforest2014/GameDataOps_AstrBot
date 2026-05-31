@@ -644,7 +644,9 @@ _REPORT_LEAD_PREFIXES: tuple[str, ...] = ("发现", "假设", "待验证", "预�
 
 
 def _bold_lead_prefix(text: str) -> str:
-    """把条目开头的「发现：/假设：/待验证：/预判：」前缀加粗，其余文本不变。"""
+    """把条目开头的「发现：/假设：/待验证：/预判：」前缀加粗，其余文本不变。
+    注意：只在不需要 <font> 色包裹时调用（** 在 <font> 内飞书不支持，会渲染成字面量 **）。
+    """
     for p in _REPORT_LEAD_PREFIXES:
         for sep in ("：", ":"):
             head = p + sep
@@ -653,19 +655,32 @@ def _bold_lead_prefix(text: str) -> str:
     return text
 
 
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+
+
+def _strip_md_bold(text: str) -> str:
+    """移除 ** 加粗标记——飞书 markdown 在 <font> 标签内不支持 **，会渲染成字面量 ** 号。"""
+    return _MD_BOLD_RE.sub(r"\1", text)
+
+
 def _report_bullet_line(bullet: dict[str, Any]) -> str:
-    text = _bold_lead_prefix(str(bullet.get("text") or "").strip())
+    raw_text = str(bullet.get("text") or "").strip()
     source = str(bullet.get("source") or "")
+    kind = str(bullet.get("kind") or "plain")
     tag = _REPORT_SOURCE_TAGS.get(source)
-    # 来源小标签加粗，作为区别于正文的样式（#2）。
-    prefix = f"<font color='grey'>**[{tag}]**</font> " if tag else ""
-    # 推断/经验：整体灰字弱化（不论 kind 配色），保留来源前缀以便分析师快速判断可信度。
+    # 来源小标签：加粗放在 <font> 外面（飞书 markdown 不支持 ** 嵌套在 <font> 内）。
+    tag_prefix = f"**[{tag}]** " if tag else ""
+    # 推断/经验：整体灰字弱化；先剥去 LLM 自带的 ** 号，否则 <font> 内 ** 渲染成字面量。
     if source in _REPORT_WEAKENED_SOURCES:
-        return f"• {prefix}<font color='grey'>{text}</font>"
-    color = _REPORT_BULLET_COLORS.get(str(bullet.get("kind") or "plain"))
+        clean = _strip_md_bold(raw_text)
+        return f"• {tag_prefix}<font color='grey'>{clean}</font>"
+    color = _REPORT_BULLET_COLORS.get(kind)
     if color:
-        return f"• {prefix}<font color='{color}'>{text}</font>"
-    return f"• {prefix}{text}"
+        # 有颜色：同样不能在 <font> 内用 **，剥去后以颜色区分。
+        clean = _strip_md_bold(raw_text)
+        return f"• {tag_prefix}<font color='{color}'>{clean}</font>"
+    # 无颜色包裹（plain kind）：可安全加粗条目前缀。
+    return f"• {tag_prefix}{_bold_lead_prefix(raw_text)}"
 
 
 def _is_report_group_start(bullet: dict[str, Any]) -> bool:
@@ -972,6 +987,30 @@ def _append_chart_blocks(
             used_ids=used_chart_ids,
         )
     )
+
+
+def _render_illustrated_facts(
+    elements: list[dict[str, Any]],
+    illustrated_facts: list[dict[str, Any]],
+    trace_id: str = "",
+) -> None:
+    """渲染「要点」区块：每个 fact 配一个小型竖直柱状图（上期 vs 本期），图在上、文字在下。
+    若 fact 没有 chart 则只输出文字。
+    """
+    from game_data_ai.charts import chart_spec_to_feishu_element
+
+    if not illustrated_facts:
+        return
+    elements.append({"tag": "markdown", "content": "**要点**"})
+    for item in illustrated_facts:
+        text = str(item.get("text") or "").strip()
+        chart = item.get("chart")
+        if chart:
+            el = chart_spec_to_feishu_element(chart, element_id=str(chart.get("chart_id") or "gd_cmp"))
+            if el:
+                elements.append(el)
+        if text:
+            elements.append({"tag": "markdown", "content": f"• {text}"})
 
 
 def _chart_series_data_table(series: list[dict[str, Any]]) -> str:
@@ -1427,6 +1466,7 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     rendering = payload.get("rendering") or {}
     preferred = rendering.get("preferred", "table")
     charts = answer.get("charts") or []
+    illustrated_facts = answer.get("illustrated_facts") or []
     trace_id = payload.get("trace_id", "")
     session_id = payload.get("session_id", "")
     template_id = answer.get("template_id", "catalog.adhoc")
@@ -1440,7 +1480,8 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
         {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"},
     ]
     _append_answer_notices(elements, answer)
-    if charts:
+    # 只在没有 illustrated_facts（每指标内嵌图）时才渲染顶层汇总图表块。
+    if charts and not illustrated_facts:
         _append_chart_blocks(
             elements,
             charts,
@@ -1492,11 +1533,14 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
             )
         elif facts_md and not charts:
             elements.append({"tag": "markdown", "content": f"**说明**\n{facts_md}"})
-        if facts_md and adhoc_tbl:
+        if facts_md and adhoc_tbl and not illustrated_facts:
             elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
-    elif facts_md:
+    elif facts_md and not illustrated_facts:
         elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
-    if facts_md and sections:
+    # illustrated_facts: 每个指标带一个内嵌小图，放在 sections 之后、引用之前。
+    if illustrated_facts:
+        _render_illustrated_facts(elements, illustrated_facts, trace_id)
+    elif facts_md and sections:
         elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
 
     rag_md = _lineage_rag_block(answer.get("rag_citations") or [])

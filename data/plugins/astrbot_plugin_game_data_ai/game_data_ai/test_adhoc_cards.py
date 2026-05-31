@@ -231,3 +231,96 @@ def test_build_result_cards_json_routes_adhoc():
     )
     assert len(cards) == 1
     assert cards[0]["header"]["template"] == "wathet"
+
+
+# --- B4: illustrated_facts 内嵌图表 -------------------------------------------
+
+
+def test_illustrated_facts_renders_chart_and_text_per_fact():
+    """每个 illustrated_fact 应先渲染小图再渲染文字，且不产生顶层图表块。"""
+    payload = {
+        "trace_id": "tr_test",
+        "answer": {
+            "title": "仙魔 · 近一周付费对比",
+            "summary": "本期付费略降。",
+            "query_mode": "adhoc",
+            "template_id": "catalog.adhoc",
+            "illustrated_facts": [
+                {
+                    "text": "上期付费金额 14,303,059，本期 13,936,305，变化 -2.6%。",
+                    "chart": {
+                        "chart_id": "cmp_pay_amount",
+                        "type": "bar",
+                        "title": "付费金额（元）",
+                        "labels": ["上期\n05/17~05/23", "本期\n05/24~05/30"],
+                        "datasets": [{"name": "付费金额（元）", "values": [14303059, 13936305]}],
+                        "direction": "vertical",
+                    },
+                },
+                {
+                    "text": "上期付费人数 57,178，本期 55,984，变化 -2.1%。",
+                    "chart": {
+                        "chart_id": "cmp_pay_users",
+                        "type": "bar",
+                        "title": "付费人数",
+                        "labels": ["上期\n05/17~05/23", "本期\n05/24~05/30"],
+                        "datasets": [{"name": "付费人数", "values": [57178, 55984]}],
+                        "direction": "vertical",
+                    },
+                },
+                {
+                    "text": "上期付费率 0.84 %，本期 0.78 %（-0.06 个百分点）。",
+                },
+            ],
+        },
+        "rendering": {"preferred": "table"},
+    }
+    card = build_adhoc_result_card_json(payload)
+    elements = card["body"]["elements"]
+    tags = [e.get("tag") for e in elements]
+
+    # 应存在 chart_image 元素（两个指标带图）
+    chart_elements = [e for e in elements if e.get("tag") == "chart"]
+    assert len(chart_elements) >= 2, f"want >= 2 chart elements, got {len(chart_elements)}"
+
+    # 应有「要点」标题
+    md_contents = [e.get("content", "") for e in elements if e.get("tag") == "markdown"]
+    assert any("要点" in c for c in md_contents)
+
+    # 三个 illustrated_fact 的文字都应出现在卡片中
+    all_text = " ".join(md_contents)
+    assert "14,303,059" in all_text
+    assert "57,178" in all_text or "57178" in all_text
+    assert "付费率" in all_text
+
+
+def test_illustrated_facts_no_top_level_chart_block():
+    """有 illustrated_facts 时，不应再有顶层「图表」大标题。"""
+    payload = {
+        "trace_id": "tr_x",
+        "answer": {
+            "title": "t",
+            "summary": "s",
+            "query_mode": "adhoc",
+            "charts": [],  # 空顶层图表
+            "illustrated_facts": [
+                {
+                    "text": "上期 100，本期 90，变化 -10%。",
+                    "chart": {
+                        "chart_id": "c1",
+                        "type": "bar",
+                        "title": "值",
+                        "labels": ["上期", "本期"],
+                        "datasets": [{"name": "值", "values": [100, 90]}],
+                        "direction": "vertical",
+                    },
+                }
+            ],
+        },
+        "rendering": {"preferred": "table"},
+    }
+    card = build_adhoc_result_card_json(payload)
+    md_contents = [e.get("content", "") for e in card["body"]["elements"] if e.get("tag") == "markdown"]
+    all_text = " ".join(md_contents)
+    # 不应有「图表」这个大标题
+    assert "**图表**" not in all_text
