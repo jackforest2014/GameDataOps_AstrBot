@@ -165,6 +165,50 @@ def test_build_adhoc_result_card_json_uses_wathet_header():
     )
 
 
+def test_week_compare_change_chart_renders_chart_element():
+    card = build_adhoc_result_card_json(
+        {
+            "trace_id": "tr_wc",
+            "session_id": "sess_1",
+            "answer": {
+                "title": "仙魔 · 近一周付费对比",
+                "summary": "本期 vs 上期，金额变化 -5.0%。",
+                "query_mode": "adhoc",
+                "template_id": "catalog.adhoc",
+                "charts": [
+                    {
+                        "chart_id": "week_compare_delta",
+                        "type": "bar",
+                        "title": "两期核心指标环比变化（%）",
+                        "labels": ["付费金额", "付费人数", "ARPPU"],
+                        "datasets": [{"name": "环比%", "values": [-5.0, -2.9, -2.2]}],
+                    }
+                ],
+                "sections": [
+                    {
+                        "stage_label": "一",
+                        "title": "两期汇总对比",
+                        "adhoc_table": {
+                            "columns": [{"key": "metric", "label": "指标", "type": "string"}],
+                            "rows": [{"metric": "付费金额"}],
+                            "row_count": 1,
+                        },
+                    }
+                ],
+                "facts": ["上期付费金额 14,492,784，本期 13,765,204，变化 -5.0%。"],
+                "methodology": "catalog.adhoc",
+                "sql_digest": "abc",
+            },
+        }
+    )
+    body = card["body"]["elements"]
+    # 图表先于"要点"文字出现，实现图文结合（#1）。
+    assert any(el.get("tag") == "chart" for el in body)
+    assert any(
+        el.get("tag") == "markdown" and "要点" in el.get("content", "") for el in body
+    )
+
+
 def test_build_result_cards_json_routes_adhoc():
     cards = build_result_cards_json(
         {
