@@ -1,10 +1,13 @@
 """Unit tests for structured report (answer.report) Feishu card rendering."""
 
 from game_data_ai.cards import (
+    _clean_citation_snippet,
+    _lineage_rag_block,
     _report_bullet_line,
     _report_elements,
     _report_header_element,
     _report_paragraph_md,
+    _report_section_elements,
     build_report_card_json,
     build_result_cards_json,
     build_verification_cards_json,
@@ -116,6 +119,93 @@ def test_bullet_no_source_falls_back_to_kind_color():
     # 未标注 source 时保持旧行为（与 test_bullet_kind_colors 一致）。
     assert "blue" in _report_bullet_line({"kind": "finding", "text": "x"})
     assert _report_bullet_line({"kind": "plain", "text": "z"}) == "• z"
+
+
+# --- A2: 排版（小标签加粗、分组空行、概述首句+列表） ----------------------
+
+
+def test_bullet_tag_and_lead_prefix_are_bold():
+    line = _report_bullet_line(
+        {"kind": "finding", "source": "doc_fact", "text": "发现：版本空窗"}
+    )
+    assert "**[事实]**" in line  # 来源标签加粗
+    assert "**发现：**" in line  # 条目前缀加粗
+
+
+def test_group_blank_line_between_finding_groups():
+    section = {
+        "title": "关键发现与假设检验",
+        "level": 1,
+        "bullets": [
+            {"kind": "finding", "source": "doc_fact", "text": "发现：A"},
+            {"kind": "hypothesis", "source": "inference", "text": "假设：B"},
+            {"kind": "finding", "source": "doc_fact", "text": "发现：C"},
+        ],
+    }
+    els = _report_section_elements(section)
+    bullets_md = els[-1]["content"]
+    # 第二个 finding 之前应有空行（\n\n），第一个 finding 与其假设之间无空行。
+    assert "\n\n" in bullets_md
+    assert bullets_md.count("\n\n") == 1
+
+
+def test_group_blank_line_between_forecasts():
+    section = {
+        "title": "预判与展望",
+        "level": 1,
+        "bullets": [
+            {"kind": "forecast", "text": "预判：X"},
+            {"kind": "forecast", "text": "预判：Y"},
+        ],
+    }
+    bullets_md = _report_section_elements(section)[-1]["content"]
+    assert "\n\n" in bullets_md  # 两条预判之间有空行
+
+
+def test_summary_section_leads_then_lists():
+    section = {
+        "title": "结论概述",
+        "level": 1,
+        "paragraphs": [
+            "核心结论一句话。第二点原因。第三点佐证。第四点展望。",
+        ],
+    }
+    content = _report_section_elements(section)[-1]["content"]
+    # 概述应先有一两句话，再以列表（• ）罗列其余句子。
+    assert "• " in content
+    assert content.count("• ") >= 2
+
+
+def test_summary_short_text_stays_paragraph():
+    section = {"title": "结论概述", "level": 1, "paragraphs": ["只有一句话。"]}
+    content = _report_section_elements(section)[-1]["content"]
+    assert "• " not in content  # 短文本不强行列表
+
+
+# --- A3: 引用 snippet 清洗 ---------------------------------------------------
+
+
+def test_clean_citation_snippet_strips_table_markdown():
+    raw = "# 所有appid\n| app_id | 描述 |\n| --- | --- |\n| 101725348225 | 每个user_id全局唯一 |"
+    out = _clean_citation_snippet(raw)
+    assert "---" not in out
+    assert "所有appid" in out and "app_id" in out
+    assert "\n" not in out  # 压成一行
+
+
+def test_lineage_rag_block_uses_cleaned_snippet():
+    md = _lineage_rag_block(
+        [
+            {
+                "document_title": "仙魔业务文档",
+                "project_id": "xianmo",
+                "locator": "版本日期",
+                "snippet": "| 版本号 | 起始日期 |\n| --- | --- |\n| 4000 | 2026-06-11 |",
+            }
+        ]
+    )
+    assert "| --- |" not in md
+    assert "**[1]**" in md and "仙魔业务文档" in md
 
 
 def _verification_payload() -> dict:

@@ -639,11 +639,26 @@ def _report_paragraph_md(text: str) -> str:
     return _REPORT_INDENT + _report_strip_heading(text)
 
 
+# 条目前缀（发现/假设/待验证/预判…）：加粗以与正文区分，便于快速扫读分组。
+_REPORT_LEAD_PREFIXES: tuple[str, ...] = ("发现", "假设", "待验证", "预判", "预期")
+
+
+def _bold_lead_prefix(text: str) -> str:
+    """把条目开头的「发现：/假设：/待验证：/预判：」前缀加粗，其余文本不变。"""
+    for p in _REPORT_LEAD_PREFIXES:
+        for sep in ("：", ":"):
+            head = p + sep
+            if text.startswith(head):
+                return f"**{head}**" + text[len(head):]
+    return text
+
+
 def _report_bullet_line(bullet: dict[str, Any]) -> str:
-    text = str(bullet.get("text") or "").strip()
+    text = _bold_lead_prefix(str(bullet.get("text") or "").strip())
     source = str(bullet.get("source") or "")
     tag = _REPORT_SOURCE_TAGS.get(source)
-    prefix = f"<font color='grey'>[{tag}]</font> " if tag else ""
+    # 来源小标签加粗，作为区别于正文的样式（#2）。
+    prefix = f"<font color='grey'>**[{tag}]**</font> " if tag else ""
     # 推断/经验：整体灰字弱化（不论 kind 配色），保留来源前缀以便分析师快速判断可信度。
     if source in _REPORT_WEAKENED_SOURCES:
         return f"• {prefix}<font color='grey'>{text}</font>"
@@ -653,22 +668,53 @@ def _report_bullet_line(bullet: dict[str, Any]) -> str:
     return f"• {prefix}{text}"
 
 
+def _is_report_group_start(bullet: dict[str, Any]) -> bool:
+    """分组起点：以「事实/发现」或「预判」开头，其后的假设/待验证/经验归入同组（#2）。"""
+    kind = str(bullet.get("kind") or "")
+    source = str(bullet.get("source") or "")
+    return kind in ("finding", "forecast") or source == "doc_fact"
+
+
+def _grouped_bullet_lines(bullets: list[dict[str, Any]]) -> list[str]:
+    """渲染 bullet，并在不同分组之间插入空行，避免密密麻麻一整块。"""
+    lines: list[str] = []
+    for i, b in enumerate(bullets):
+        if i > 0 and _is_report_group_start(b):
+            lines.append("")  # 组间空行
+        lines.append(_report_bullet_line(b))
+    return lines
+
+
+def _summary_paragraph_md(paragraphs: list[str]) -> str:
+    """结论概述：先一两句话的概述，再把其余句子拆成列表，避免一大段密集文字（#2）。"""
+    text = " ".join(_report_strip_heading(p) for p in paragraphs if str(p).strip())
+    sentences = [s.strip() for s in re.split(r"(?<=[。！？!?])", text) if s.strip()]
+    if len(sentences) <= 2:
+        return _REPORT_INDENT + text
+    lead_n = 2 if len(sentences) >= 4 else 1
+    lead = "".join(sentences[:lead_n])
+    rest = sentences[lead_n:]
+    body = [_REPORT_INDENT + lead, ""]
+    body.extend(f"• {s}" for s in rest)
+    return "\n".join(body)
+
+
 def _report_section_elements(section: dict[str, Any]) -> list[dict[str, Any]]:
     elements: list[dict[str, Any]] = []
     title = str(section.get("title") or "").strip()
     level = int(section.get("level") or 1)
     if title:
         elements.append(_report_header_element(title, level))
-    paragraphs = [
-        _report_paragraph_md(p)
-        for p in (section.get("paragraphs") or [])
-        if str(p).strip()
-    ]
-    if paragraphs:
-        elements.append({"tag": "markdown", "content": "\n\n".join(paragraphs)})
+    raw_paragraphs = [p for p in (section.get("paragraphs") or []) if str(p).strip()]
+    if raw_paragraphs:
+        if "概述" in title:
+            content = _summary_paragraph_md(raw_paragraphs)
+        else:
+            content = "\n\n".join(_report_paragraph_md(p) for p in raw_paragraphs)
+        elements.append({"tag": "markdown", "content": content})
     bullets = section.get("bullets") or []
     if bullets:
-        lines = "\n".join(_report_bullet_line(b) for b in bullets)
+        lines = "\n".join(_grouped_bullet_lines(bullets))
         elements.append({"tag": "markdown", "content": lines})
     return elements
 
@@ -967,6 +1013,24 @@ def _table_mode_hint(series: list[dict[str, Any]]) -> str:
     )
 
 
+_TABLE_SEP_RE = re.compile(r"^\|?[\s:|\-]+\|?$")
+
+
+def _clean_citation_snippet(snippet: str) -> str:
+    """把原始表格 markdown 压成一行可读摘要：去掉 `| --- |` 分隔行、标题井号，
+    单元格竖线转成轻量分隔符，多余空白折叠（#3 防御兜底）。"""
+    parts: list[str] = []
+    for ln in snippet.splitlines():
+        s = ln.strip()
+        if not s or _TABLE_SEP_RE.match(s):
+            continue
+        s = s.lstrip("#").strip()
+        s = re.sub(r"\s*\|\s*", " · ", s).strip(" ·")
+        if s:
+            parts.append(s)
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
 def _lineage_rag_block(citations: list[dict[str, Any]]) -> str:
     """论文式尾注引用区。
 
@@ -984,7 +1048,7 @@ def _lineage_rag_block(citations: list[dict[str, Any]]) -> str:
         title = c.get("document_title", "未命名文档")
         proj = c.get("project_id", "")
         loc = c.get("locator", "")
-        snippet = (c.get("snippet") or "").strip()
+        snippet = _clean_citation_snippet(c.get("snippet") or "")
         if len(snippet) > 160:
             snippet = snippet[:160] + "…"
         body = f"**[{idx}]** {title}."

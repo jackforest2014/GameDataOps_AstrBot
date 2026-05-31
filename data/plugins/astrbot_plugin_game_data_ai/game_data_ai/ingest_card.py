@@ -59,7 +59,6 @@ def build_ingest_confirm_card(
                     "tag": "markdown",
                     "content": (
                         f"**{doc_title}**\n\n"
-                        "上方已根据文档内容返回本次分析。"
                         "若希望后续问数可长期引用该文档，可选择 **入库**；"
                         "**暂不入库** 不影响本次结果。"
                     ),
