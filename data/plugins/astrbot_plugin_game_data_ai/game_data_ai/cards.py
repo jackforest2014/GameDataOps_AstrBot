@@ -1461,10 +1461,12 @@ def _adhoc_trace_block(answer: dict[str, Any], trace_id: str, template_id: str) 
         extra += f"\n生成轮次 {attempts}"
     if codes:
         extra += f"\n审核码 {', '.join(str(c) for c in codes[:5])}"
+    datasource_label = answer.get("datasource_label") or ""
+    datasource_line = f"\n数仓来源 **{datasource_label}**" if datasource_label else ""
     return (
         f"**追溯信息**\n"
         f"trace `{trace_id}` · 模式 `adhoc` · 模板 `{template_id}`{extra}\n"
-        f"口径 {answer.get('methodology', '')}\n"
+        f"口径 {answer.get('methodology', '')}{datasource_line}\n"
         f"SQL digest `{answer.get('sql_digest', '')}`"
     )
 
