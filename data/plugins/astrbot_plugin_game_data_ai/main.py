@@ -518,7 +518,9 @@ class GameDataAIPlugin(star.Star):
         for i, card in enumerate(cards):
             ok = False
             if event is not None:
-                ok = await self._try_send_lark_card(event, card, chat_id, message_id)
+                # 直发到会话（receive_id），不用 areply 回复路径：进度卡已回复过同一条
+                # 用户消息，再次 areply 同一消息会卡住约 30s 才超时（见 14:26 日志）。
+                ok = await self._try_send_lark_card(event, card, chat_id, "")
             if not ok:
                 ok = await self._send_card_from_action(None, card, chat_id)
             sent_card = sent_card or ok
@@ -544,32 +546,112 @@ class GameDataAIPlugin(star.Star):
         self.sse_hub.ensure_connected(user_id)
         attachments = build_attachments(question)
 
-        # 飞书原生流式进度卡：streaming_mode=True 时显示加载动画，分析结束后关闭
+        # 飞书原生流式进度卡：streaming_mode=True 配合定时刷新文字制造加载动画。
+        # CardKit sequence 必须从 1 开始且严格递增，每次更新前自增。
         progress_card_id: str | None = None
-        if isinstance(event, LarkMessageEvent):
+        progress_seq = 0
+        progress_ticker: asyncio.Task | None = None
+        is_lark = isinstance(event, LarkMessageEvent)
+        logger.info(f"[game_data_ai] streaming_card.check is_lark={is_lark} chat={chat_id}")
+
+        # —— 蓝色科技感动画：原地旋转 spinner + 呼吸省略号 ——
+        # 旋转类 spinner 不做空间位移，眼睛只感知图形内部形变，低帧率(~2.5fps)下仍流畅；
+        # 而位移类（扫描条）会被眼睛追踪，低帧率必然掉帧感。
+        _SPIN_PRESETS = {
+            "ball": "⣾⣽⣻⢿⡿⣟⣯⣷",          # braille 实心球旋转（默认，最耐看）
+            "dots": "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",       # braille 经典点阵
+            "arc": "◜◠◝◞◡◟",               # 弧线旋转
+            "circle": "◐◓◑◒",              # 半圆旋转
+            "moon": "🌑🌒🌓🌔🌕🌖🌗🌘",       # 月相（自带色彩）
+        }
+        _anim_spinner = _SPIN_PRESETS.get(
+            os.getenv("GAME_DATA_AI_PROGRESS_SPINNER", "ball"), _SPIN_PRESETS["ball"]
+        )
+        _anim_dots = ["   ", "·  ", "·· ", "···"]  # 呼吸省略号（定宽，避免重绘抖动）
+
+        def _anim_frame(t: int) -> str:
+            spin = _anim_spinner[t % len(_anim_spinner)]
+            dots = _anim_dots[t % len(_anim_dots)]
+            return f"<font color='blue'>{spin} 正在分析中{dots}</font>"
+
+        async def _progress_anim() -> None:
+            """定时刷新进度卡文字，制造流畅的“分析中”动画。
+
+            所有帧可见字符等宽（颜色标签不计入显示宽度），避免重绘抖动。
+            刷新间隔受网络 RTT 约束，默认 0.4s，可用环境变量覆盖。
+            """
+            nonlocal progress_seq
+            try:
+                interval = float(os.getenv("GAME_DATA_AI_PROGRESS_ANIM_SEC", "0.4"))
+            except ValueError:
+                interval = 0.4
+            interval = min(max(interval, 0.2), 2.0)
+
+            i = 1
+            # 上限保护：即使异常路径漏调用 _close_progress，也不会无限刷新。
+            while i < 720:
+                try:
+                    await asyncio.sleep(interval)
+                    progress_seq += 1
+                    await event._update_streaming_text(
+                        progress_card_id, _anim_frame(i), progress_seq
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _exc:
+                    logger.debug(f"[game_data_ai] 进度动画刷新失败: {_exc}")
+                i += 1
+
+        if is_lark:
             try:
                 progress_card_id = await event._create_streaming_card()
+                logger.info(f"[game_data_ai] streaming_card.created card_id={progress_card_id}")
                 if progress_card_id:
-                    await event._send_card_message(
+                    sent = await event._send_card_message(
                         progress_card_id,
                         reply_message_id=message_id,
                         receive_id=chat_id,
                         receive_id_type="chat_id",
                     )
+                    logger.info(f"[game_data_ai] streaming_card.sent ok={sent}")
+                    if sent:
+                        # 写入初始文字，触发 streaming_mode 打字动画（sequence 从 1 起）
+                        progress_seq += 1
+                        upd = await event._update_streaming_text(
+                            progress_card_id, _anim_frame(0), progress_seq
+                        )
+                        logger.info(
+                            f"[game_data_ai] streaming_card.text ok={upd} seq={progress_seq}"
+                        )
+                        # 启动后台动画刷新
+                        progress_ticker = asyncio.create_task(_progress_anim())
+                    else:
+                        progress_card_id = None
             except Exception as _exc:
                 logger.warning(f"[game_data_ai] 流式进度卡片失败，回退纯文本: {_exc}")
                 progress_card_id = None
 
         if not progress_card_id:
+            logger.info("[game_data_ai] streaming_card.fallback plain_result")
             yield event.plain_result(build_progress_plain())
 
         async def _close_progress(text: str) -> None:
-            """更新进度卡片文本并关闭 streaming_mode；无卡片时静默返回。"""
+            """停止动画、写入最终文字并关闭 streaming_mode；无卡片时静默返回。"""
+            nonlocal progress_seq, progress_ticker
+            if progress_ticker is not None:
+                progress_ticker.cancel()
+                try:
+                    await progress_ticker
+                except (asyncio.CancelledError, Exception):
+                    pass
+                progress_ticker = None
             if not progress_card_id or not isinstance(event, LarkMessageEvent):
                 return
             try:
-                await event._update_streaming_text(progress_card_id, text, 1)
-                await event._close_streaming_mode(progress_card_id, 2)
+                progress_seq += 1
+                await event._update_streaming_text(progress_card_id, text, progress_seq)
+                progress_seq += 1
+                await event._close_streaming_mode(progress_card_id, progress_seq)
             except Exception as _exc:
                 logger.warning(f"[game_data_ai] 关闭流式进度卡片失败: {_exc}")
 
