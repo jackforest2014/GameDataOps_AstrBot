@@ -28,6 +28,7 @@ for _mod in list(sys.modules):
 from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.platform import MessageType
+from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
 
 from game_data_ai.cards import (
     build_denied_plain,
@@ -543,7 +544,34 @@ class GameDataAIPlugin(star.Star):
         self.sse_hub.ensure_connected(user_id)
         attachments = build_attachments(question)
 
-        yield event.plain_result(build_progress_plain())
+        # 飞书原生流式进度卡：streaming_mode=True 时显示加载动画，分析结束后关闭
+        progress_card_id: str | None = None
+        if isinstance(event, LarkMessageEvent):
+            try:
+                progress_card_id = await event._create_streaming_card()
+                if progress_card_id:
+                    await event._send_card_message(
+                        progress_card_id,
+                        reply_message_id=message_id,
+                        receive_id=chat_id,
+                        receive_id_type="chat_id",
+                    )
+            except Exception as _exc:
+                logger.warning(f"[game_data_ai] 流式进度卡片失败，回退纯文本: {_exc}")
+                progress_card_id = None
+
+        if not progress_card_id:
+            yield event.plain_result(build_progress_plain())
+
+        async def _close_progress(text: str) -> None:
+            """更新进度卡片文本并关闭 streaming_mode；无卡片时静默返回。"""
+            if not progress_card_id or not isinstance(event, LarkMessageEvent):
+                return
+            try:
+                await event._update_streaming_text(progress_card_id, text, 1)
+                await event._close_streaming_mode(progress_card_id, 2)
+            except Exception as _exc:
+                logger.warning(f"[game_data_ai] 关闭流式进度卡片失败: {_exc}")
 
         try:
             payload = await self.client.chat_messages(
@@ -556,6 +584,7 @@ class GameDataAIPlugin(star.Star):
                 attachments=attachments or None,
             )
         except Exception as e:
+            await _close_progress("❌ 平台暂时不可用，请稍后重试")
             logger.error(f"[game_data_ai] API 调用失败: {e}")
             yield event.plain_result(f"平台暂时不可用：{e}")
             return
@@ -566,6 +595,7 @@ class GameDataAIPlugin(star.Star):
         if status == "failed":
             err = payload.get("error") or {}
             if err.get("code") == "document_auth_required":
+                await _close_progress("🔐 需要飞书文档授权，请查看下方链接")
                 auth_url = self.client.abs_url(
                     f"/api/v1/auth/feishu/start?feishu_user_id={user_id}"
                 )
@@ -574,6 +604,7 @@ class GameDataAIPlugin(star.Star):
                     f"请打开：{auth_url}\n完成后重新发送文档链接。"
                 )
                 return
+            await _close_progress("⚠️ 分析遇到问题，请查看下方详情")
             for line in await self._deliver_query_payload(
                 event, chat_id, message_id, payload
             ):
@@ -601,6 +632,7 @@ class GameDataAIPlugin(star.Star):
 
         # Legacy: old backend may still return awaiting_ingest_decision without answer.
         if status == "awaiting_ingest_decision" and not payload.get("answer"):
+            await _close_progress("📄 文档已解析，等待入库确认")
             for doc in payload.get("pending_documents") or []:
                 await self._send_ingest_confirm_card(
                     trace_id=trace_id,
@@ -613,6 +645,7 @@ class GameDataAIPlugin(star.Star):
             )
             return
 
+        await _close_progress("✅ 分析完成，结果见下方")
         for line in await self._deliver_query_payload(
             event, chat_id, message_id, payload
         ):
