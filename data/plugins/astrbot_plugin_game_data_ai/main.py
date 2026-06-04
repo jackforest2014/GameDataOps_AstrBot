@@ -261,6 +261,9 @@ class GameDataAIPlugin(star.Star):
         elif route == "schedule":
             async for result in self._handle_schedule(event, text):
                 yield result
+        elif route == "chitchat":
+            async for result in self._handle_chitchat(event, text):
+                yield result
         else:
             async for result in self._handle_query(event, text):
                 yield result
@@ -535,6 +538,35 @@ class GameDataAIPlugin(star.Star):
             + "\n".join(f"- {f}" for f in (answer.get("facts") or [])[:5])
             + f"\n\ntrace: {payload.get('trace_id', '')}"
         ]
+
+    async def _handle_chitchat(self, event: AstrMessageEvent, question: str):
+        """普通聊天（PRD §5.3.3 d）：后端意图识别 Agent 拟人作答，直接发纯文本，
+        不出"正在分析"进度卡 / 流式卡 / 结果卡。"""
+        user_id, chat_id, message_id = _feishu_ids(event)
+        if not user_id or not message_id:
+            yield event.plain_result("无法识别飞书用户或消息 ID，请重试。")
+            return
+        try:
+            payload = await self.client.chat_messages(
+                feishu_user_id=user_id,
+                feishu_chat_id=chat_id,
+                feishu_message_id=message_id,
+                question=question,
+                chat_type="p2p",
+                session_id=f"sess_{chat_id}",
+            )
+        except Exception as e:
+            logger.error(f"[game_data_ai] chitchat API 调用失败: {e}")
+            yield event.plain_result(f"平台暂时不可用：{e}")
+            return
+        answer = payload.get("answer") or {}
+        reply = (answer.get("summary") or "").strip()
+        if not reply:
+            reply = "你好，我是数据分析助手小数。你可以问我某个授权项目的指标数据，或业务概念。"
+        logger.info(
+            f"[game_data_ai] chitchat.reply trace={payload.get('trace_id', '')} chat={chat_id}"
+        )
+        yield event.plain_result(reply)
 
     async def _handle_query(self, event: AstrMessageEvent, question: str):
         user_id, chat_id, message_id = _feishu_ids(event)

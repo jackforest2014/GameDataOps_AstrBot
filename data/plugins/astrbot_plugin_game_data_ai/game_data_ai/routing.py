@@ -85,7 +85,26 @@ def detect_route(text: str) -> str:
         return "schedule"
     if is_date_follow_up(text):
         return "query"
+    if _is_chitchat_intent(t):
+        return "chitchat"
     return "ignore"
+
+
+# 纯打招呼 / 问助手是谁能做什么（PRD §5.3.3 d）：后端拟人作答，前端发纯文本即可
+GREETINGS = (
+    "你好", "您好", "你好啊", "在吗", "在么", "嗨", "哈喽", "hi", "hello", "hey",
+    "早上好", "下午好", "晚上好", "谢谢", "多谢", "辛苦了", "再见", "拜拜",
+)
+CHITCHAT_KEYWORDS = (
+    "你是谁", "你叫什么", "你能做什么", "你会做什么", "你能干什么", "你是什么", "自我介绍",
+)
+
+
+def _is_chitchat_intent(t: str) -> bool:
+    s = (t or "").strip()
+    if s in GREETINGS:
+        return True
+    return any(k in s for k in CHITCHAT_KEYWORDS)
 
 
 def is_date_follow_up(text: str) -> bool:

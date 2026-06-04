@@ -45,7 +45,14 @@ async def resolve_route(
                 session_id=f"sess_{chat_id}" if chat_id else None,
             )
             route = (payload.get("route") or "ignore").strip().lower()
-            if route in ("query", "schedule", "cancel", "list_schedules", "ignore"):
+            if route in (
+                "query",
+                "chitchat",
+                "schedule",
+                "cancel",
+                "list_schedules",
+                "ignore",
+            ):
                 return route
         except Exception as e:
             logger.warning(f"[game_data_ai] route.api_failed fallback=keywords: {e}")
