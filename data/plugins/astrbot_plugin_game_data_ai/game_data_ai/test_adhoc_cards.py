@@ -3,11 +3,63 @@
 from game_data_ai.cards import (
     _adhoc_table_element,
     _adhoc_table_markdown,
+    _append_native_table_or_markdown,
+    _section_header_md,
     _section_header_element,
     _wow_week_compare_table_element,
     build_adhoc_result_card_json,
     build_result_cards_json,
 )
+
+
+def test_adhoc_table_markdown_rich_keeps_font_and_br_without_truncation():
+    """render_mode=markdown cells carry inline <font>/<br> (colored 变化量+变化率);
+    rich rendering must keep the markup intact and must not truncate (>48 chars)."""
+    long_delta = "404.81万元<br><font color='red'>−41.67万元 ↓10.3%</font>"
+    md = _adhoc_table_markdown(
+        {
+            "columns": [
+                {"key": "window", "label": "对比口径", "type": "string"},
+                {"key": "revenue", "label": "游戏收入(充值)", "type": "string"},
+            ],
+            "rows": [{"window": "前一天（日环比）", "revenue": long_delta}],
+            "row_count": 1,
+            "render_mode": "markdown",
+        },
+        heading=None,
+        rich=True,
+    )
+    assert "<font color='red'>" in md  # color preserved
+    assert "<br>" in md  # second line preserved
+    assert "↓10.3%" in md and "…" not in md  # not truncated
+
+
+def test_force_markdown_table_does_not_consume_native_budget():
+    elements: list[dict] = []
+    table_seq = [1]
+    native_budget = [0]  # no native slots left, but markdown still renders
+    _append_native_table_or_markdown(
+        elements,
+        table={
+            "columns": [{"key": "a", "label": "A", "type": "string"}],
+            "rows": [{"a": "x<br><font color='green'>+1 ↑5%</font>"}],
+            "row_count": 1,
+            "render_mode": "markdown",
+        },
+        table_seq=table_seq,
+        native_budget=native_budget,
+    )
+    joined = "".join(e.get("content", "") for e in elements if e.get("tag") == "markdown")
+    assert "<font color='green'>" in joined
+    assert table_seq[0] == 1  # native sequence untouched
+
+
+def test_section_header_md_drops_stage_label_prefix():
+    """Chapter label only drives color now; the visible title must not carry the
+    redundant "流水构成 · " prefix (链路点3)."""
+    md = _section_header_md({"stage_label": "流水构成", "title": "广告消耗(投放)"})
+    assert md == "**广告消耗(投放)**"
+    assert "流水构成 ·" not in md
 
 
 def test_adhoc_table_markdown_renders_columns_and_rows():
@@ -25,6 +77,67 @@ def test_adhoc_table_markdown_renders_columns_and_rows():
         }
     )
     assert "渠道" in md and "ios" in md and "340" in md
+
+
+def test_adhoc_table_markdown_sanitizes_newline_headers_and_drops_sql_caption():
+    """Curated section tables use 2-line headers ("对比日\\n2026-06-01"); the
+    Markdown fallback must flatten the newline (no phantom rows) and must NOT
+    claim it is a raw SQL dump."""
+    md = _adhoc_table_markdown(
+        {
+            "columns": [
+                {"key": "product", "label": "充值商品", "type": "string"},
+                {"key": "comp", "label": "对比日\n2026-06-01", "type": "string"},
+                {"key": "main", "label": "分析日\n2026-06-08", "type": "string"},
+            ],
+            "rows": [{"product": "36500钻石", "comp": "21.59万元", "main": "8.69万元"}],
+            "row_count": 1,
+        },
+        heading=None,
+    )
+    header_line = next(line for line in md.splitlines() if "充值商品" in line)
+    # Header is a single Markdown row: date wrapped onto the same cell, no break.
+    assert "对比日 2026-06-01" in header_line
+    assert "分析日 2026-06-08" in header_line
+    assert "原始行" not in md and "按需 SQL" not in md
+    assert "查询结果" not in md  # heading=None → no redundant title line
+
+
+def test_section_header_chapter_color_by_stage_label():
+    """章节用「标题着色」区分（白底高对比），不再用深色底+白字（用户反馈不可读）。"""
+    cases = {"涨跌榜": "purple", "异常": "red", "流水构成": "blue", "下钻": "grey"}
+    for stage, color in cases.items():
+        el = _section_header_element({"stage_label": stage, "title": f"{stage} · 测试"})
+        assert el["tag"] == "markdown"
+        assert f"<font color='{color}'>" in el["content"], stage
+        assert "background_style" not in el  # no dark band
+        assert "white" not in el["content"]  # no unreadable white text
+
+
+def test_section_header_plain_when_no_stage_tint():
+    el = _section_header_element({"stage_label": "其他", "title": "普通段落"})
+    assert el["tag"] == "markdown"
+
+
+def test_adhoc_index_column_compact_text_not_decimal():
+    el = _adhoc_table_element(
+        {
+            "columns": [
+                {"key": "idx", "label": "#", "type": "string", "width": "80px"},
+                {"key": "name", "label": "活动主名", "type": "string"},
+            ],
+            "rows": [{"idx": "1", "name": "世界杯活动"}, {"idx": "2", "name": "五一活动"}],
+            "row_count": 2,
+        },
+        element_id="gdTblIdx",
+    )
+    assert el is not None
+    idx_col = el["columns"][0]
+    assert idx_col["data_type"] == "text"
+    assert idx_col["width"] == "80px"
+    assert idx_col["horizontal_align"] == "center"
+    assert el["rows"][0]["idx"] == "1"
+    assert el["rows"][1]["idx"] == "2"
 
 
 def test_adhoc_table_element_native_text_and_freeze():
@@ -77,7 +190,7 @@ def test_build_adhoc_result_card_json_uses_native_table():
     assert tables[0]["columns"][0]["data_type"] == "number"
 
 
-def test_section_header_gain_loss_use_white_text_on_tint():
+def test_section_header_gain_loss_use_colored_title_text():
     gain = _section_header_element(
         {
             "stage_label": "二",
@@ -92,11 +205,11 @@ def test_section_header_gain_loss_use_white_text_on_tint():
             "summary": "流水减少的计费点 Top 10。",
         }
     )
-    for el, bg in ((gain, "green"), (loss, "red")):
-        assert el["background_style"] == bg
-        md = el["columns"][0]["elements"][0]["content"]
-        assert "<font color='white'>" in md
-        assert "Top" in md
+    for el, color in ((gain, "green"), (loss, "red")):
+        assert el["tag"] == "markdown"
+        assert f"<font color='{color}'>" in el["content"]
+        assert "Top" in el["content"]
+        assert "white" not in el["content"]
 
 
 def test_build_adhoc_sections_use_native_tables():

@@ -516,7 +516,9 @@ def _append_card_footer(
 def _section_header_md(sec: dict[str, Any], *, text_color: str | None = None) -> str:
     label = sec.get("stage_label") or ""
     title = sec.get("title") or label
-    header = f"**{label} · {title}**" if label else f"**{title}**"
+    # 章节标签（流水构成/异常/涨跌榜/下钻）仅用于底色区分，不再拼进标题文本，避免
+    # 形如「流水构成 · 消耗对比 · 广告消耗(投放)」的冗长前缀（链路点3）。
+    header = f"**{title}**"
     if sec.get("summary"):
         header += f"\n{sec['summary']}"
     if text_color:
@@ -524,44 +526,41 @@ def _section_header_md(sec: dict[str, Any], *, text_color: str | None = None) ->
     return header
 
 
+def _colored_title_header(sec: dict[str, Any], color: str) -> dict[str, Any]:
+    """Section title as colored bold text on the normal card background.
+
+    替代旧的「深色底+白字」色块：飞书 column_set 底色偏深，白字在其上对比度低、
+    难以辨认（用户反馈）。改为给标题文字本身上色（标题加粗着色、摘要保持默认色），
+    在白底卡片上对比度高、清晰可读，同时仍用颜色区分章节。
+    """
+    label = sec.get("stage_label") or ""
+    title = sec.get("title") or label
+    content = f"<font color='{color}'>**{title}**</font>"
+    if sec.get("summary"):
+        content += f"\n{sec['summary']}"
+    return {"tag": "markdown", "content": content}
+
+
+# 章节配色（链路点5/6：用颜色区分章节）。优先匹配标题里的涨/跌幅贡献，其次按 stage_label
+# 给「流水构成 / 异常 / 涨跌榜」上不同标题色，下钻子章节用灰色，普通段落不上色。
+_SECTION_STAGE_COLOR: dict[str, str] = {
+    "流水构成": "blue",
+    "异常": "red",
+    "涨跌榜": "purple",
+    "下钻": "grey",
+}
+
+
 def _section_header_element(sec: dict[str, Any]) -> dict[str, Any]:
-    """Section title element with optional gain/loss background tint."""
+    """Section title element with a per-chapter color cue (链路点5/6)."""
     title = str(sec.get("title") or "")
-    # 深绿/深红底需浅色字；飞书 markdown 支持 white 等枚举色名。
     if "涨幅贡献" in title:
-        md = _section_header_md(sec, text_color="white")
-        return {
-            "tag": "column_set",
-            "flex_mode": "none",
-            "background_style": "green",
-            "horizontal_spacing": "default",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "vertical_align": "top",
-                    "elements": [{"tag": "markdown", "content": md}],
-                }
-            ],
-        }
+        return _colored_title_header(sec, "green")
     if "跌幅贡献" in title:
-        md = _section_header_md(sec, text_color="white")
-        return {
-            "tag": "column_set",
-            "flex_mode": "none",
-            "background_style": "red",
-            "horizontal_spacing": "default",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "vertical_align": "top",
-                    "elements": [{"tag": "markdown", "content": md}],
-                }
-            ],
-        }
+        return _colored_title_header(sec, "red")
+    stage = str(sec.get("stage_label") or "")
+    if stage in _SECTION_STAGE_COLOR:
+        return _colored_title_header(sec, _SECTION_STAGE_COLOR[stage])
     return {"tag": "markdown", "content": _section_header_md(sec)}
 
 
@@ -959,7 +958,8 @@ def build_pay_weekly_cards_json(payload: dict[str, Any]) -> list[dict[str, Any]]
 
 def build_result_cards_json(payload: dict[str, Any]) -> list[dict[str, Any]]:
     answer = payload.get("answer") or {}
-    if answer.get("query_mode") == "adhoc" or answer.get("adhoc_table"):
+    qm = answer.get("query_mode") or ""
+    if qm in ("adhoc", "realtime_consume") or answer.get("adhoc_table"):
         return [build_adhoc_result_card_json(payload)]
     sections = answer.get("sections") or []
     if sections and _is_pay_weekly_sections(sections):
@@ -1165,11 +1165,19 @@ def _parse_adhoc_number(value: Any) -> float | None:
         return None
 
 
+def _adhoc_index_column(col: dict[str, Any]) -> bool:
+    key = (col.get("key") or "").lower()
+    label = (col.get("display_name") or col.get("label") or "").strip()
+    return key in ("idx", "index", "seq", "序号") or label in ("#", "序号")
+
+
 def _adhoc_column_def(col: dict[str, Any], *, is_first: bool) -> dict[str, Any]:
     key = col.get("key") or ""
     label = col.get("display_name") or col.get("label") or key
     col_type = (col.get("type") or "string").lower()
-    width = "140px" if is_first else "auto"
+    if _adhoc_index_column(col):
+        col_type = "string"
+    width = col.get("width") or ("auto" if _adhoc_index_column(col) else ("140px" if is_first else "auto"))
     if col_type == "number":
         return {
             "name": key,
@@ -1179,13 +1187,14 @@ def _adhoc_column_def(col: dict[str, Any], *, is_first: bool) -> dict[str, Any]:
             "horizontal_align": "right",
             "format": {"separator": True, "precision": 2},
         }
+    align = "center" if _adhoc_index_column(col) else "left"
     return {
         "name": key,
         "display_name": label,
         "data_type": "text",
-        "width": width if is_first else "auto",
+        "width": width,
         "vertical_align": "top",
-        "horizontal_align": "left",
+        "horizontal_align": align,
     }
 
 
@@ -1243,7 +1252,9 @@ def _adhoc_table_element(
             "background_style": "grey",
             "text_color": "default",
             "bold": True,
-            "lines": 1,
+            # Allow two-line headers so role+date (e.g. "对比日" / "2026-05-30")
+            # wrap instead of truncating behind the column edge.
+            "lines": 2,
         },
         "columns": feishu_cols,
         "rows": native_rows,
@@ -1341,7 +1352,10 @@ def _append_native_table_or_markdown(
         return
     if not table:
         return
-    if native_budget[0] > 0:
+    # render_mode=markdown：单元格带 <font> 着色/ <br> 多行（如「变化量+变化率」红跌绿涨），
+    # 飞书原生 table 单元格是纯文本不渲染富文本，故强制走 Markdown（不占用原生表配额）。
+    force_md = str(table.get("render_mode") or "").lower() == "markdown"
+    if not force_md and native_budget[0] > 0:
         el = _adhoc_table_element(
             table,
             element_id=_feishu_table_element_id(table_seq[0]),
@@ -1364,7 +1378,7 @@ def _append_native_table_or_markdown(
                     }
                 )
             return
-    table_md = _adhoc_table_markdown(table, heading=None)
+    table_md = _adhoc_table_markdown(table, heading=None, rich=force_md)
     if table_md:
         elements.append({"tag": "markdown", "content": table_md})
 
@@ -1414,8 +1428,15 @@ def _adhoc_table_markdown(
     *,
     max_rows: int = 40,
     heading: str | None = None,
+    rich: bool = False,
 ) -> str:
-    """Generic markdown table from platform answer.adhoc_table."""
+    """Generic markdown table from platform answer.adhoc_table.
+
+    rich=True (render_mode=markdown): cells are already Markdown-ready and may
+    carry inline <font>/<br> (e.g. colored 变化量+变化率). Such cells must NOT be
+    run through _format_adhoc_cell (which truncates at 48 chars and would corrupt
+    the markup); only a raw pipe is escaped and \n is normalized to <br>.
+    """
     if not table:
         return ""
     cols = table.get("columns") or []
@@ -1424,22 +1445,43 @@ def _adhoc_table_markdown(
         return f"**{heading or '查询结果'}**\n<font color='grey'>无匹配行。</font>"
     if not cols:
         cols = [{"key": k, "label": k, "type": "string"} for k in rows[0].keys()]
-    headers = [c.get("label") or c.get("key") or "?" for c in cols]
-    title = heading or "查询结果"
-    lines = [
-        f"**{title}**",
-        "<font color='grey'>按需 SQL 查询；下表为平台返回的原始行（最多展示 "
-        f"{max_rows} 行）。</font>",
-        "",
-        "| " + " | ".join(headers) + " |",
-        "| " + " | ".join("---" for _ in headers) + " |",
-    ]
+
+    # Markdown table cells/headers must be single-line and not contain a raw pipe,
+    # else the row breaks across lines (curated 2-line headers like "对比日\n2026-06-01"
+    # otherwise split into phantom rows). Native tables handle \n; the Markdown
+    # fallback (when the 5-native-table budget is spent) must sanitize it.
+    def _md_cell(value: Any) -> str:
+        return str(value if value is not None else "").replace("\n", " ").replace("|", "/").strip()
+
+    # Rich cells keep <font>/<br>; an embedded \n becomes <br> (line break in cell).
+    def _rich_cell(value: Any) -> str:
+        return str(value if value is not None else "").replace("|", "/").replace("\n", "<br>").strip()
+
+    headers = [_md_cell(c.get("label") or c.get("key") or "?") for c in cols]
+    lines: list[str] = []
+    # heading=None means a section already rendered its own title above — avoid a
+    # redundant "查询结果" line. Curated section tables are NOT raw SQL dumps, so the
+    # misleading "原始行（最多展示 N 行）" caption is dropped here.
+    if heading:
+        lines.append(f"**{heading}**")
+    lines.extend(
+        [
+            "",
+            "| " + " | ".join(headers) + " |",
+            "| " + " | ".join("---" for _ in headers) + " |",
+        ]
+    )
     display = rows[:max_rows]
     for row in display:
-        cells = [
-            _format_adhoc_cell(row.get(c.get("key", "")), c.get("type", "string"))
-            for c in cols
-        ]
+        if rich:
+            cells = [_rich_cell(row.get(c.get("key", ""))) for c in cols]
+        else:
+            cells = [
+                _md_cell(
+                    _format_adhoc_cell(row.get(c.get("key", "")), c.get("type", "string"))
+                )
+                for c in cols
+            ]
         lines.append("| " + " | ".join(cells) + " |")
     row_count = int(table.get("row_count") or len(rows))
     truncated = bool(table.get("truncated")) or len(rows) > max_rows
@@ -1503,7 +1545,24 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     sections = answer.get("sections") or []
     table_seq = [0]
     native_budget = [_MAX_FEISHU_NATIVE_TABLES]
-    if not chart_only and sections:
+    used_section_chart_ids: set[str] = set()
+    if not chart_only:
+        adhoc_tbl = answer.get("adhoc_table")
+        if adhoc_tbl:
+            # Main comparison table ALWAYS renders first — drill-down sections
+            # must not suppress the root table (previously an `if sections /
+            # elif` made the root table vanish whenever a section existed).
+            _append_native_table_or_markdown(
+                elements,
+                table=adhoc_tbl,
+                heading="查询结果",
+                table_seq=table_seq,
+                native_budget=native_budget,
+            )
+            if facts_md and not illustrated_facts and not sections:
+                elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
+        elif facts_md and not charts and not sections:
+            elements.append({"tag": "markdown", "content": f"**说明**\n{facts_md}"})
         for sec in sections:
             title = sec.get("title") or (sec.get("stage_label") or "")
             elements.append(_section_header_element(sec))
@@ -1531,21 +1590,8 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
                     max_charts=1,
                     heading=f"**{title} · 图表**",
                     trace_id=trace_id,
+                    used_chart_ids=used_section_chart_ids,
                 )
-    elif not chart_only:
-        adhoc_tbl = answer.get("adhoc_table")
-        if adhoc_tbl:
-            _append_native_table_or_markdown(
-                elements,
-                table=adhoc_tbl,
-                heading="查询结果",
-                table_seq=table_seq,
-                native_budget=native_budget,
-            )
-        elif facts_md and not charts:
-            elements.append({"tag": "markdown", "content": f"**说明**\n{facts_md}"})
-        if facts_md and adhoc_tbl and not illustrated_facts:
-            elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
     elif facts_md and not illustrated_facts:
         elements.append({"tag": "markdown", "content": f"**要点**\n{facts_md}"})
     # illustrated_facts: 每个指标带一个内嵌小图，放在 sections 之后、引用之前。
@@ -1771,7 +1817,8 @@ def build_verification_cards_json(payload: dict[str, Any]) -> dict[str, Any]:
 
 def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     answer = payload.get("answer") or {}
-    if answer.get("query_mode") == "adhoc" or answer.get("adhoc_table"):
+    qm = answer.get("query_mode") or ""
+    if qm in ("adhoc", "realtime_consume") or answer.get("adhoc_table"):
         return build_adhoc_result_card_json(payload)
     report = answer.get("report") or {}
     if report.get("sections"):

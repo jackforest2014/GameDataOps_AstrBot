@@ -10,6 +10,10 @@ from typing import Any
 _PERIOD_COLORS = ["#3370FF", "#85A5FF"]
 _PERIOD_DOMAIN = ["近一周", "前一周"]
 
+# 当日实时消耗四窗（对齐 EPM F3 累积曲线）
+_REALTIME_CONSUME_DOMAIN = ["今天", "昨天", "一周前", "一月前"]
+_REALTIME_CONSUME_COLORS = ["#E53935", "#1E88E5", "#43A047", "#8E24AA"]
+
 # 横向条形图：条厚与容器高度（飞书 chart 支持 height=NNpx 固定高度）
 _BAR_MAX_WIDTH = 10
 _WK_CMP_BAR_MAX_WIDTH = 18
@@ -17,9 +21,130 @@ _WK_CMP_BAR_HEIGHT_PX = 72
 _WK_CMP_LEGEND_HEIGHT_PX = 34
 _DAILY_BAR_BAND_PX = 14
 _DAILY_BAR_BASE_PX = 28
+# 少类目排行横条（如 游戏充值 Top-N）：柱体更粗、行高适中，避免被压成发丝线，
+# 也不要像默认 4:3 那样把几根柱子拉得很开。
+_RANK_BAR_MAX_WIDTH = 24
+_RANK_BAR_BAND_PX = 40
+_RANK_BAR_BASE_PX = 28
 # 按日流水折线：横轴日期、留足左侧与底部标签区
 _DAILY_LINE_HEIGHT_PX = 240
 _DAILY_LINE_ASPECT = "5:2"
+
+
+def _realtime_consume_color_scale(*, field: str = "period") -> dict[str, Any]:
+    return {
+        "type": "ordinal",
+        "field": field,
+        "domain": _REALTIME_CONSUME_DOMAIN,
+        "range": _REALTIME_CONSUME_COLORS,
+    }
+
+
+def _realtime_consume_label_indices(labels: list[str], anchor_idx: int | None, *, step: int = 6) -> set[int]:
+    """Sample ~every 3h on axis; always include anchor bucket."""
+    n = len(labels)
+    if n == 0:
+        return set()
+    show = {i for i in range(0, n, max(step, 1))}
+    show.add(n - 1)
+    if anchor_idx is not None and 0 <= int(anchor_idx) < n:
+        show.add(int(anchor_idx))
+    return show
+
+
+def _realtime_consume_values_sampled(
+    values: list[dict[str, Any]],
+    labels: list[str],
+    anchor_idx: int | None,
+    *,
+    series_field: str,
+    label_step: int = 6,
+) -> list[dict[str, Any]]:
+    """Sparse value labels on the curve (today series only) to avoid clutter."""
+    if not values or not labels:
+        return values
+    idx_by_label = {lab: i for i, lab in enumerate(labels)}
+    show_idx = _realtime_consume_label_indices(labels, anchor_idx, step=label_step)
+    out: list[dict[str, Any]] = []
+    for row in values:
+        r = dict(row)
+        lab = str(r.get("label") or "")
+        i = idx_by_label.get(lab)
+        period = str(r.get(series_field) or "")
+        if period == "今天" and i is not None and i in show_idx and "value" in r:
+            r["valueLabel"] = r["value"]
+        out.append(r)
+    return out
+
+
+def _realtime_consume_cum_chart_body(
+    spec: dict[str, Any],
+    values: list[dict[str, Any]],
+    *,
+    title: str,
+    x_field: str,
+    y_field: str,
+    series_field: str,
+) -> dict[str, Any]:
+    labels = spec.get("labels") or []
+    anchor_idx = spec.get("anchor_bucket_index")
+    if anchor_idx is not None:
+        try:
+            anchor_idx = int(anchor_idx)
+        except (TypeError, ValueError):
+            anchor_idx = None
+    values = _realtime_consume_values_sampled(
+        values, labels, anchor_idx, series_field=series_field,
+    )
+    x_title = str(spec.get("x_axis_title") or "时间")
+    y_title = str(spec.get("y_axis_title") or "累积点券（万）")
+    body: dict[str, Any] = {
+        "type": "line",
+        "media": [],
+        "title": {"text": title, "textStyle": {"fontSize": 12}},
+        "data": {"values": values},
+        "xField": x_field,
+        "yField": y_field,
+        "seriesField": series_field,
+        "color": _realtime_consume_color_scale(field=series_field),
+        "point": {"visible": False},
+        "line": {"style": {"lineWidth": 2.5, "curveType": "monotone"}},
+        "label": {
+            "visible": True,
+            "field": "valueLabel",
+            "position": "top",
+            "style": {"fontSize": 9},
+            "overlap": False,
+        },
+        "legends": _chart_legends(orient="top"),
+        "padding": {"top": 24, "bottom": 48, "left": 56, "right": 16},
+        "axes": [
+            {
+                "orient": "left",
+                "title": {"visible": True, "text": y_title, "textStyle": {"fontSize": 10}},
+                "label": {"style": {"fontSize": 10}},
+            },
+            {
+                "orient": "bottom",
+                "title": {"visible": True, "text": x_title, "textStyle": {"fontSize": 10}},
+                "label": {
+                    "style": {"fontSize": 9},
+                    "autoHide": True,
+                    "autoHideMethod": "greedy",
+                },
+            },
+        ],
+    }
+    if anchor_idx is not None and 0 <= anchor_idx < len(labels):
+        anchor_x = labels[anchor_idx]
+        body["markLine"] = [
+            {
+                "x": anchor_x,
+                "label": {"text": "锚点", "position": "end", "style": {"fontSize": 9}},
+                "line": {"style": {"stroke": "#9E9E9E", "lineDash": [4, 4]}},
+            }
+        ]
+    return body
 
 
 def _period_color_scale(*, field: str | None = "period") -> dict[str, Any]:
@@ -371,9 +496,34 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
     if multi_series:
         y_name = "数值"
 
+    if chart_id == "realtime_consume_cum" and chart_type == "line" and multi_series:
+        chart_body = _realtime_consume_cum_chart_body(
+            spec,
+            values,
+            title=title,
+            x_field=x_field,
+            y_field=y_field,
+            series_field=series_field,
+        )
+        return _make_chart_element(
+            chart_body,
+            element_id=element_id or chart_id or "gd_rt_cum",
+            height_px=300,
+            aspect_ratio="16:9",
+            margin="8px 4px",
+        )
+
     if chart_type == "pie":
         category_field = x_field or "label"
         wow_pie = _is_wow_billing_pie(spec)
+        # Attach a per-slice percent string so non-wow pies can show 占比 inside
+        # each slice (the user asked for in-slice percentages).
+        if not wow_pie:
+            total = sum(float(v.get(y_field, v.get("value", 0)) or 0) for v in values)
+            if total > 0:
+                for v in values:
+                    raw = float(v.get(y_field, v.get("value", 0)) or 0)
+                    v["percent"] = f"{raw / total * 100:.1f}%"
         chart_body: dict[str, Any] = {
             "type": "pie",
             "media": [],
@@ -396,7 +546,12 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
                     "line": {"visible": True},
                 }
                 if wow_pie
-                else {"visible": True}
+                else {
+                    "visible": True,
+                    "position": "inside",
+                    "formatter": "{percent}",
+                    "style": {"fill": "#ffffff", "fontSize": 10},
+                }
             ),
             "legends": (
                 {"visible": False}
@@ -503,7 +658,6 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
         chart_body["direction"] = "horizontal"
         chart_body["xField"] = y_field
         chart_body["yField"] = x_field
-        chart_body["barMaxWidth"] = _BAR_MAX_WIDTH
         chart_body["axes"] = [
             {
                 "orient": "left",
@@ -521,11 +675,25 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
                 "label": {"style": {"fontSize": 9}},
             },
         ]
-        if is_daily_revenue and not is_line:
-            height_px = _height_for_horizontal_bars(
-                len(labels), per_band=_DAILY_BAR_BAND_PX, base=_DAILY_BAR_BASE_PX
-            )
+        # Compact height for single-series horizontal bars: a tall 4:3 canvas
+        # stretches a few rows far apart. Size height to band count to keep
+        # spacing tight. Daily charts have many thin bars; ranking charts have a
+        # few categories and need thicker, clearly-visible bars.
+        if not is_line:
+            if is_daily_revenue:
+                chart_body["barMaxWidth"] = _BAR_MAX_WIDTH
+                height_px = _height_for_horizontal_bars(
+                    len(labels), per_band=_DAILY_BAR_BAND_PX, base=_DAILY_BAR_BASE_PX
+                )
+            else:
+                chart_body["barMaxWidth"] = _RANK_BAR_MAX_WIDTH
+                height_px = _height_for_horizontal_bars(
+                    len(labels), per_band=_RANK_BAR_BAND_PX, base=_RANK_BAR_BASE_PX
+                )
             margin = "4px 0"
+        else:
+            chart_body["barMaxWidth"] = _BAR_MAX_WIDTH
+        if is_daily_revenue and not is_line:
             chart_body["title"] = {
                 "text": title,
                 "textStyle": {"fontSize": 11},
@@ -587,6 +755,9 @@ _CHART_ID_SHORT: dict[str, str] = {
     "wk_cmp_panel": "wkPan",
     "wk_legend": "wkLeg",
     "revenue_2d": "rev2d",
+    "realtime_consume_cum": "rtCum",
+    "company_benchmark_daily": "cbDay",
+    "company_benchmark_contrib_pie": "cbPie",
 }
 
 
