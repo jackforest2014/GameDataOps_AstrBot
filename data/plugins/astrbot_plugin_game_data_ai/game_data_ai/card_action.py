@@ -220,8 +220,16 @@ async def _handle_schedule_cancel(
     if action != "schedule_cancel_confirm":
         return
 
-    form = _form_value(event)
-    raw_ids = form.get("schedule_ids") or form.get("Schedule_ids") or []
+    # Source of selected ids, in priority order:
+    #   1) button value: per-task {"schedule_id": "..."} or 取消全部 {"schedule_ids": [...]}
+    #   2) form value (legacy checkboxes card, kept for back-compat)
+    #   3) the token's full candidate list in store (last-resort)
+    raw_ids: Any = value.get("schedule_ids")
+    if not raw_ids and value.get("schedule_id"):
+        raw_ids = [value.get("schedule_id")]
+    if not raw_ids:
+        form = _form_value(event)
+        raw_ids = form.get("schedule_ids") or form.get("Schedule_ids") or []
     if isinstance(raw_ids, str):
         schedule_ids = [raw_ids]
     else:

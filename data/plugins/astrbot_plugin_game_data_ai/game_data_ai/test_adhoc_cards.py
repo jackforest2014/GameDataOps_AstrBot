@@ -103,15 +103,23 @@ def test_adhoc_table_markdown_sanitizes_newline_headers_and_drops_sql_caption():
     assert "查询结果" not in md  # heading=None → no redundant title line
 
 
-def test_section_header_chapter_color_by_stage_label():
-    """章节用「标题着色」区分（白底高对比），不再用深色底+白字（用户反馈不可读）。"""
-    cases = {"涨跌榜": "purple", "异常": "red", "流水构成": "blue", "下钻": "grey"}
-    for stage, color in cases.items():
+def test_section_header_chapter_tint_by_stage_label():
+    """章节用底色块区分；按底色深浅选字色：深底(blue/red/purple)白字、浅底(grey)默认深字，
+    保证对比度（用户第三轮反馈：深底上深字看不清）。"""
+    dark = {"涨跌榜": "purple", "异常": "red", "流水构成": "blue"}
+    for stage, color in dark.items():
         el = _section_header_element({"stage_label": stage, "title": f"{stage} · 测试"})
-        assert el["tag"] == "markdown"
-        assert f"<font color='{color}'>" in el["content"], stage
-        assert "background_style" not in el  # no dark band
-        assert "white" not in el["content"]  # no unreadable white text
+        assert el["tag"] == "column_set"
+        assert el["background_style"] == color, stage
+        content = el["columns"][0]["elements"][0]["content"]
+        assert "**" in content  # bold title
+        assert "white" in content, stage  # 深底用白字保证对比度
+    # 浅灰底（下钻子章节）仍用默认深字。
+    grey = _section_header_element({"stage_label": "下钻", "title": "下钻 · 测试"})
+    assert grey["background_style"] == "grey"
+    grey_content = grey["columns"][0]["elements"][0]["content"]
+    assert "**" in grey_content
+    assert "white" not in grey_content
 
 
 def test_section_header_plain_when_no_stage_tint():
@@ -190,7 +198,7 @@ def test_build_adhoc_result_card_json_uses_native_table():
     assert tables[0]["columns"][0]["data_type"] == "number"
 
 
-def test_section_header_gain_loss_use_colored_title_text():
+def test_section_header_gain_loss_use_tinted_background():
     gain = _section_header_element(
         {
             "stage_label": "二",
@@ -206,10 +214,11 @@ def test_section_header_gain_loss_use_colored_title_text():
         }
     )
     for el, color in ((gain, "green"), (loss, "red")):
-        assert el["tag"] == "markdown"
-        assert f"<font color='{color}'>" in el["content"]
-        assert "Top" in el["content"]
-        assert "white" not in el["content"]
+        assert el["tag"] == "column_set"
+        assert el["background_style"] == color
+        content = el["columns"][0]["elements"][0]["content"]
+        assert "Top" in content
+        assert "white" in content  # 深底(green/red)用白字保证对比度
 
 
 def test_build_adhoc_sections_use_native_tables():
@@ -247,6 +256,48 @@ def test_build_adhoc_sections_use_native_tables():
         [{"metric": "m", "p1": "1", "p2": "2", "delta": "0"}],
         element_id="t0",
     )["freeze_first_column"]
+
+
+def test_dashboard_section_title_not_duplicated():
+    """大盘 section 表：标题只应由 section header 渲染一次；表前不得再打印一遍同名标题
+    （用户反馈「大部分表格的标题都重复了一遍」）。"""
+    card = build_adhoc_result_card_json(
+        {
+            "trace_id": "tr_dash",
+            "session_id": "sess_1",
+            "answer": {
+                "title": "公司大盘日报",
+                "summary": "共 2 张表。",
+                "query_mode": "dashboard",
+                "adhoc_table": {
+                    "columns": [{"key": "m", "label": "指标", "type": "string"}],
+                    "rows": [{"m": "总流水"}],
+                    "row_count": 1,
+                    "render_mode": "markdown",
+                },
+                "sections": [
+                    {
+                        "title": "窗口汇总",
+                        "adhoc_table": {
+                            "columns": [{"key": "m", "label": "指标", "type": "string"}],
+                            "rows": [{"m": "总流水"}],
+                            "row_count": 1,
+                            "render_mode": "markdown",
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    def _count(token: str) -> int:
+        n = 0
+        for el in card["body"]["elements"]:
+            if el.get("tag") == "markdown" and token in (el.get("content") or ""):
+                n += 1
+        return n
+
+    assert _count("窗口汇总") == 1, "section title must render exactly once"
 
 
 def test_build_adhoc_result_card_json_uses_wathet_header():

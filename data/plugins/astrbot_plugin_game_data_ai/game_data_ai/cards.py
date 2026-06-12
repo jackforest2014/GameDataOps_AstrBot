@@ -448,15 +448,6 @@ def _append_card_footer(
     with_feedback: bool = True,
 ) -> None:
     answer = payload.get("answer") or {}
-    trace_id = payload.get("trace_id", "")
-    session_id = payload.get("session_id", "")
-    template_id = answer.get("template_id", "")
-    trace_block = (
-        f"**追溯信息**\n"
-        f"trace `{trace_id}` · 模板 `{template_id}`\n"
-        f"口径 {answer.get('methodology', '')}\n"
-        f"SQL digest `{answer.get('sql_digest', '')}`"
-    )
     rag_md = _lineage_rag_block(answer.get("rag_citations") or [])
     if rag_md:
         elements.append({"tag": "hr"})
@@ -464,53 +455,8 @@ def _append_card_footer(
     exp_md = _lineage_experience_block(answer.get("experience_reuse"))
     if exp_md:
         elements.append({"tag": "markdown", "content": exp_md})
-    elements.append({"tag": "hr"})
-    elements.append({"tag": "markdown", "content": trace_block})
-    if not with_feedback:
-        return
-    elements.append(
-        {
-            "tag": "markdown",
-            "content": (
-                "<font color='grey'>反馈与沉淀为独立动作：可先点「有用」，"
-                "再点「沉淀模板候选」。</font>"
-            ),
-        }
-    )
-    buttons = [
-        _feedback_button("有用", "good_case", trace_id, session_id, template_id, primary=True),
-        _feedback_button("有问题", "bad_case", trace_id, session_id, template_id),
-        _feedback_button(
-            "沉淀模板候选", "sql_template_candidate", trace_id, session_id, template_id
-        ),
-    ]
-    elements.append(
-        {
-            "tag": "column_set",
-            "flex_mode": "trisect",
-            "horizontal_spacing": "default",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [buttons[0]],
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [buttons[1]],
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [buttons[2]],
-                },
-            ],
-        }
-    )
+    # 卡片末尾「反馈与沉淀」文案与按钮（有用/有问题/沉淀模板候选）暂时下线（用户要求）。
+    return
 
 
 def _section_header_md(sec: dict[str, Any], *, text_color: str | None = None) -> str:
@@ -526,24 +472,55 @@ def _section_header_md(sec: dict[str, Any], *, text_color: str | None = None) ->
     return header
 
 
-def _colored_title_header(sec: dict[str, Any], color: str) -> dict[str, Any]:
-    """Section title as colored bold text on the normal card background.
+# 深色底用浅色(白)字、浅色底(grey)用默认深字，保证对比度（用户第三轮反馈）。
+_DARK_SECTION_BG = {"blue", "red", "purple", "green", "carmine", "indigo", "turquoise"}
 
-    替代旧的「深色底+白字」色块：飞书 column_set 底色偏深，白字在其上对比度低、
-    难以辨认（用户反馈）。改为给标题文字本身上色（标题加粗着色、摘要保持默认色），
-    在白底卡片上对比度高、清晰可读，同时仍用颜色区分章节。
+
+def _tinted_section_header(sec: dict[str, Any], bg_color: str) -> dict[str, Any]:
+    """整行底色标题块：column_set 单列 + background_style + 按底色深浅选字色。
+
+    历史教训（用户三轮反馈）：
+    1. 早期「底色 + 白字」——当时部分主题色客户端呈浅色填充，白字看不清。
+    2. 随后去掉底色、改纯着色文字——用户希望把底色加回来。
+    3. 加回底色后改默认深字——但 blue/red/purple/green 在客户端实际渲染为**深**底，
+       深字落在深底上对比度差、看不清。
+    本版：按底色深浅选字色——深底(blue/red/purple/green)用**白字**、浅底(grey)用默认深字。
     """
     label = sec.get("stage_label") or ""
     title = sec.get("title") or label
-    content = f"<font color='{color}'>**{title}**</font>"
+    light_text = bg_color in _DARK_SECTION_BG
+    # 加粗放在 <font> 外层（飞书 markdown 不支持 ** 嵌在 <font> 内）。
+    title_md = f"**{title}**"
+    if light_text:
+        title_md = f"**<font color='white'>{title}</font>**"
+    content = title_md
     if sec.get("summary"):
-        content += f"\n{sec['summary']}"
-    return {"tag": "markdown", "content": content}
+        summary = sec["summary"]
+        if light_text:
+            summary = f"<font color='white'>{summary}</font>"
+        content += f"\n{summary}"
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "background_style": bg_color,
+        "horizontal_spacing": "default",
+        "margin": "8px 0 4px 0",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [{"tag": "markdown", "content": content}],
+            }
+        ],
+    }
 
 
-# 章节配色（链路点5/6：用颜色区分章节）。优先匹配标题里的涨/跌幅贡献，其次按 stage_label
-# 给「流水构成 / 异常 / 涨跌榜」上不同标题色，下钻子章节用灰色，普通段落不上色。
-_SECTION_STAGE_COLOR: dict[str, str] = {
+# 章节底色（链路点5/6：用底色区分章节）。优先匹配标题里的涨/跌幅贡献，其次按 stage_label
+# 给「流水构成 / 异常 / 涨跌榜」上不同底色，下钻子章节用灰底，普通段落不上底色。
+# 取值均为飞书主题浅色填充，配默认深色加粗标题文字保证可读。
+_SECTION_STAGE_BG: dict[str, str] = {
     "流水构成": "blue",
     "异常": "red",
     "涨跌榜": "purple",
@@ -552,15 +529,15 @@ _SECTION_STAGE_COLOR: dict[str, str] = {
 
 
 def _section_header_element(sec: dict[str, Any]) -> dict[str, Any]:
-    """Section title element with a per-chapter color cue (链路点5/6)."""
+    """Section title element with a per-chapter tinted background (链路点5/6)."""
     title = str(sec.get("title") or "")
     if "涨幅贡献" in title:
-        return _colored_title_header(sec, "green")
+        return _tinted_section_header(sec, "green")
     if "跌幅贡献" in title:
-        return _colored_title_header(sec, "red")
+        return _tinted_section_header(sec, "red")
     stage = str(sec.get("stage_label") or "")
-    if stage in _SECTION_STAGE_COLOR:
-        return _colored_title_header(sec, _SECTION_STAGE_COLOR[stage])
+    if stage in _SECTION_STAGE_BG:
+        return _tinted_section_header(sec, _SECTION_STAGE_BG[stage])
     return {"tag": "markdown", "content": _section_header_md(sec)}
 
 
@@ -1006,16 +983,28 @@ def _render_illustrated_facts(
     """渲染「要点」区块：每个 fact 配一个小型竖直柱状图（上期 vs 本期），图在上、文字在下。
     若 fact 没有 chart 则只输出文字。
     """
-    from game_data_ai.charts import chart_spec_to_feishu_element
+    from game_data_ai.charts import _feishu_element_id, chart_spec_to_feishu_element
 
     if not illustrated_facts:
         return
     elements.append({"tag": "markdown", "content": "**要点**"})
+    # Feishu chart element_id 限 20 字符、须字母开头、仅字母数字下划线；务必经
+    # _feishu_element_id 归一化，否则后端较长的 chart_id（如 company_realtime_revenue）
+    # 会触发 300301 卡片创建失败。
+    seen: set[str] = set()
+    seq = 0
     for item in illustrated_facts:
         text = str(item.get("text") or "").strip()
         chart = item.get("chart")
         if chart:
-            el = chart_spec_to_feishu_element(chart, element_id=str(chart.get("chart_id") or "gd_cmp"))
+            cid = str(chart.get("chart_id") or "gd_cmp")
+            eid = _feishu_element_id(cid, seq=seq)
+            while eid in seen:
+                seq += 1
+                eid = _feishu_element_id(cid, seq=seq)
+            seen.add(eid)
+            seq += 1
+            el = chart_spec_to_feishu_element(chart, element_id=eid)
             if el:
                 elements.append(el)
         if text:
@@ -1494,25 +1483,6 @@ def _adhoc_table_markdown(
     return "\n".join(lines)
 
 
-def _adhoc_trace_block(answer: dict[str, Any], trace_id: str, template_id: str) -> str:
-    meta = answer.get("adhoc_meta") or {}
-    attempts = meta.get("attempts")
-    codes = meta.get("codes") or []
-    extra = ""
-    if attempts:
-        extra += f"\n生成轮次 {attempts}"
-    if codes:
-        extra += f"\n审核码 {', '.join(str(c) for c in codes[:5])}"
-    datasource_label = answer.get("datasource_label") or ""
-    datasource_line = f"\n数仓来源 **{datasource_label}**" if datasource_label else ""
-    return (
-        f"**追溯信息**\n"
-        f"trace `{trace_id}` · 模式 `adhoc` · 模板 `{template_id}`{extra}\n"
-        f"口径 {answer.get('methodology', '')}{datasource_line}\n"
-        f"SQL digest `{answer.get('sql_digest', '')}`"
-    )
-
-
 def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     """Feishu card for query_mode=adhoc (catalog.adhoc)."""
     answer = payload.get("answer") or {}
@@ -1575,10 +1545,12 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
                     native_budget=native_budget,
                 )
             if sec.get("adhoc_table"):
+                # heading=None: _section_header_element(sec) 上面已渲染过 sec.title，
+                # 这里再传 heading 会把同一标题打印第二遍（用户反馈「表格标题重复了一遍」）。
                 _append_native_table_or_markdown(
                     elements,
                     table=sec.get("adhoc_table"),
-                    heading=title,
+                    heading=None,
                     table_seq=table_seq,
                     native_budget=native_budget,
                 )
@@ -1607,42 +1579,7 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     exp_md = _lineage_experience_block(answer.get("experience_reuse"))
     if exp_md:
         elements.append({"tag": "markdown", "content": exp_md})
-    elements.append({"tag": "hr"})
-    elements.append(
-        {"tag": "markdown", "content": _adhoc_trace_block(answer, trace_id, template_id)}
-    )
-    elements.append(
-        {
-            "tag": "markdown",
-            "content": (
-                "<font color='grey'>反馈与沉淀为独立动作：可先点「有用」，"
-                "再点「沉淀模板候选」。</font>"
-            ),
-        }
-    )
-    buttons = [
-        _feedback_button("有用", "useful", trace_id, session_id, template_id, primary=True),
-        _feedback_button("Bad Case", "bad_case", trace_id, session_id, template_id),
-        _feedback_button(
-            "沉淀模板候选", "save_template_candidate", trace_id, session_id, template_id
-        ),
-    ]
-    elements.append(
-        {
-            "tag": "column_set",
-            "flex_mode": "none",
-            "horizontal_spacing": "default",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [btn],
-                }
-                for btn in buttons
-            ],
-        }
-    )
+    # 卡片末尾「反馈与沉淀」文案与按钮（有用/Bad Case/沉淀模板候选）暂时下线（用户要求）。
 
     card = {
         "schema": "2.0",
@@ -1838,12 +1775,6 @@ def build_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
     sections = answer.get("sections") or []
     head_facts, _ = _split_decline_facts(facts)
     facts_md = "\n".join(f"• {f}" for f in head_facts[:5])
-    trace_block = (
-        f"**追溯信息**\n"
-        f"trace `{trace_id}` · 模板 `{template_id}`\n"
-        f"口径 {answer.get('methodology', '')}\n"
-        f"SQL digest `{answer.get('sql_digest', '')}`"
-    )
 
     is_chart = preferred == "chart"
     used_chart_element_ids: set[str] = set()

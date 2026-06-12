@@ -335,17 +335,85 @@ class GameDataAIPlugin(star.Star):
         except Exception as e:
             yield event.plain_result(f"取消预览失败：{e}")
             return
+
+        items = preview.get("items") or []
         token = preview.get("action_token", "")
         if token:
             self._cancel_candidates[token] = [
-                it.get("schedule_id", "") for it in preview.get("items") or []
+                it.get("schedule_id", "") for it in items
             ]
+
+        # First try the interactive selectable card. It is built with one
+        # 【取消此项】button per task plus 【取消全部】 (NOT `tag: checkboxes`,
+        # which 飞书 schema 2.0 rejects with 10002 "not support tag: checkboxes").
+        # Buttons are supported on all 飞书 versions, so this normally succeeds.
         card = build_cancel_preview_card(preview)
         sent = await self._try_send_lark_card(event, card, chat_id, message_id)
-        if not sent:
-            items = preview.get("items") or []
-            lines = "\n".join(f"- {it.get('label', '')}" for it in items[:10])
-            yield event.plain_result(f"请选择要取消的任务（请在卡片中操作）：\n{lines}")
+        if sent:
+            return
+
+        # ----- Card send still failed (e.g. no card permission / network).
+        # Fall back to a text-only flow that converges to a successful cancel
+        # WITHOUT a card UI.
+        # This mirrors the backend's /chat/messages bottom path in
+        # internal/integration/dispatch_guards.go::buildCancelSummary so users
+        # see identical behavior whether the plugin or the backend handles it.
+
+        # Empty state — keep parity with backend wording.
+        if not items:
+            if preview.get("empty_reason") == "no_match":
+                phrase = preview.get("match_phrase") or ""
+                yield event.plain_result(
+                    f"没有匹配「{phrase}」的定时任务，可以说「我的定时任务」先看下当前都有哪些。"
+                )
+            else:
+                yield event.plain_result("你当前没有任何可取消的定时任务。")
+            return
+
+        # Auto-cancel when there is exactly one unambiguous candidate. Two
+        # sources of "unambiguous":
+        #   a) backend phrase-matched and returned exactly 1 default_selected
+        #   b) vague mode + the user only has 1 active task to begin with
+        # Both reuse the same action_token so this is a single confirmed write.
+        selected = [it for it in items if it.get("default_selected")]
+        auto_target = None
+        if len(selected) == 1:
+            auto_target = selected[0]
+        elif len(items) == 1:
+            auto_target = items[0]
+
+        if auto_target is not None and token:
+            try:
+                conf = await self.client.cancel_confirm(
+                    feishu_user_id=user_id,
+                    feishu_chat_id=chat_id,
+                    feishu_message_id=message_id,
+                    action_token=token,
+                    schedule_ids=[auto_target.get("schedule_id", "")],
+                )
+            except Exception as e:
+                yield event.plain_result(f"取消失败：{e}")
+                return
+            if conf.get("cancelled_count"):
+                label = auto_target.get("label", "")
+                yield event.plain_result(f"已取消定时任务：{label}")
+            else:
+                yield event.plain_result("取消失败，请稍后再试。")
+            return
+
+        # 多 candidates — list and ask user to be specific. Do NOT mention
+        # 「取消全部」 here: backend's ParseCancelIntent has no `all` mode, so
+        # 「取消全部」 would be treated as phrase="全部" and produce a confusing
+        # no_match result.
+        lines = [
+            "以下是你的定时任务，请直接用文字回复要取消的任务（例如「取消每天 18:56 的推送」，用更精确的时间或任务名）："
+        ]
+        for it in items[:10]:
+            label = (it.get("label") or it.get("schedule_id", "")).strip()
+            status = it.get("status", "")
+            tag = f" [{status}]" if status else ""
+            lines.append(f"  • {label}{tag}")
+        yield event.plain_result("\n".join(lines))
 
     async def _send_ingest_confirm_card(
         self,

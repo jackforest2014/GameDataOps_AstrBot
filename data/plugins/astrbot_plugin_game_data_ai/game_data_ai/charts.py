@@ -10,7 +10,9 @@ from typing import Any
 _PERIOD_COLORS = ["#3370FF", "#85A5FF"]
 _PERIOD_DOMAIN = ["近一周", "前一周"]
 
-# 当日实时消耗四窗（对齐 EPM F3 累积曲线）
+# 当日实时四窗累积曲线配色（对齐 EPM F3）：今天=红、昨天=蓝、一周前=绿、一月前=紫，
+# 跨所有指标图固定一致。公司大盘实时(company_realtime)窗名为具体星期/日期(动态)，
+# 改用按 dataset 顺序的位置配色(_realtime_cum_color_scale)，与此处颜色一一对应。
 _REALTIME_CONSUME_DOMAIN = ["今天", "昨天", "一周前", "一月前"]
 _REALTIME_CONSUME_COLORS = ["#E53935", "#1E88E5", "#43A047", "#8E24AA"]
 
@@ -37,6 +39,22 @@ def _realtime_consume_color_scale(*, field: str = "period") -> dict[str, Any]:
         "field": field,
         "domain": _REALTIME_CONSUME_DOMAIN,
         "range": _REALTIME_CONSUME_COLORS,
+    }
+
+
+def _realtime_cum_color_scale(datasets: list[dict[str, Any]], field: str) -> dict[str, Any]:
+    """按 dataset 顺序的位置配色：第1条(今天)=红、第2=蓝、第3=绿、第4=紫。
+    公司大盘实时窗名是具体星期/日期(动态)，无法用静态 domain 匹配，故按序映射，
+    保证「今天恒为红」等规格在所有指标图上一致。"""
+    names = [str(d.get("name") or "") for d in datasets if d.get("name")]
+    rng = _REALTIME_CONSUME_COLORS
+    if not names:
+        return {"type": "ordinal", "field": field, "range": rng}
+    return {
+        "type": "ordinal",
+        "field": field,
+        "domain": names,
+        "range": rng[: len(names)] if len(names) <= len(rng) else rng,
     }
 
 
@@ -87,17 +105,36 @@ def _realtime_consume_cum_chart_body(
     series_field: str,
 ) -> dict[str, Any]:
     labels = spec.get("labels") or []
+    datasets = spec.get("datasets") or []
+    chart_id = str(spec.get("chart_id") or "")
+    # 公司大盘实时(rt_*)：点状折线、无数值标签(太密)、按序位置配色。
+    is_company_rt = chart_id.startswith("rt_")
     anchor_idx = spec.get("anchor_bucket_index")
     if anchor_idx is not None:
         try:
             anchor_idx = int(anchor_idx)
         except (TypeError, ValueError):
             anchor_idx = None
-    values = _realtime_consume_values_sampled(
-        values, labels, anchor_idx, series_field=series_field,
-    )
+    if not is_company_rt:
+        values = _realtime_consume_values_sampled(
+            values, labels, anchor_idx, series_field=series_field,
+        )
     x_title = str(spec.get("x_axis_title") or "时间")
     y_title = str(spec.get("y_axis_title") or "累积点券（万）")
+    if is_company_rt:
+        color_scale = _realtime_cum_color_scale(datasets, series_field)
+        point_cfg: dict[str, Any] = {"visible": True, "style": {"size": 4}}
+        label_cfg: dict[str, Any] = {"visible": False}
+    else:
+        color_scale = _realtime_consume_color_scale(field=series_field)
+        point_cfg = {"visible": False}
+        label_cfg = {
+            "visible": True,
+            "field": "valueLabel",
+            "position": "top",
+            "style": {"fontSize": 9},
+            "overlap": False,
+        }
     body: dict[str, Any] = {
         "type": "line",
         "media": [],
@@ -106,16 +143,10 @@ def _realtime_consume_cum_chart_body(
         "xField": x_field,
         "yField": y_field,
         "seriesField": series_field,
-        "color": _realtime_consume_color_scale(field=series_field),
-        "point": {"visible": False},
+        "color": color_scale,
+        "point": point_cfg,
         "line": {"style": {"lineWidth": 2.5, "curveType": "monotone"}},
-        "label": {
-            "visible": True,
-            "field": "valueLabel",
-            "position": "top",
-            "style": {"fontSize": 9},
-            "overlap": False,
-        },
+        "label": label_cfg,
         "legends": _chart_legends(orient="top"),
         "padding": {"top": 24, "bottom": 48, "left": 56, "right": 16},
         "axes": [
@@ -496,7 +527,16 @@ def chart_spec_to_feishu_element(spec: dict[str, Any], *, element_id: str | None
     if multi_series:
         y_name = "数值"
 
-    if chart_id == "realtime_consume_cum" and chart_type == "line" and multi_series:
+    # 实时累积曲线（当日点券消耗 realtime_consume_cum，以及公司大盘实时 rt_* 各指标）：
+    # 统一走专用 body —— Y 轴用后端 y_axis_title(具体指标名)、四窗固定配色、今天截止
+    # 锚点竖虚线。识别信号：多序列折线 + 携带 anchor_bucket_index。
+    is_rt_cum_chart = (
+        chart_type == "line"
+        and multi_series
+        and bool(series_field)
+        and (chart_id == "realtime_consume_cum" or spec.get("anchor_bucket_index") is not None)
+    )
+    if is_rt_cum_chart:
         chart_body = _realtime_consume_cum_chart_body(
             spec,
             values,

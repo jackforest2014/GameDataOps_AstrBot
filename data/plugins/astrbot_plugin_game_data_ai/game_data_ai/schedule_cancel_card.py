@@ -5,7 +5,19 @@ from __future__ import annotations
 from typing import Any
 
 
+def _button(text: str, btn_type: str, value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": text},
+        "type": btn_type,
+        "value": value,
+    }
+
+
 def build_cancel_preview_card(preview: dict[str, Any]) -> dict[str, Any]:
+    # 用「每个任务一个按钮」的形态，而不是 checkboxes —— 飞书部分版本不支持
+    # `tag: checkboxes`（返回 10002 not support tag: checkboxes），按钮则全版本可用。
+    # 点某个任务的【取消此项】即删除该任务；【取消全部】携带全部 id 一次性取消。
     token = preview.get("action_token", "")
     items = preview.get("items") or []
     empty_reason = preview.get("empty_reason", "")
@@ -14,7 +26,7 @@ def build_cancel_preview_card(preview: dict[str, Any]) -> dict[str, Any]:
     elements: list[dict[str, Any]] = [
         {
             "tag": "markdown",
-            "content": "**请选择要取消的定时推送**\n勾选后点击底部【确认取消】。未勾选的任务不受影响。",
+            "content": "**请选择要取消的定时推送**\n点击对应任务的【取消此项】即可删除；或点【取消全部】。其余任务不受影响。",
         },
     ]
     if match_phrase:
@@ -33,61 +45,65 @@ def build_cancel_preview_card(preview: dict[str, Any]) -> dict[str, Any]:
             }
         )
         elements.append(
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "查看全部"},
-                "type": "default",
-                "value": {
+            _button(
+                "查看全部",
+                "default",
+                {
                     "source": "game_data_ai",
                     "action": "schedule_cancel_show_all",
                     "token": token,
                 },
-            }
+            )
         )
     else:
-        options = []
+        all_ids: list[str] = []
         for it in items:
-            label = it.get("label") or it.get("schedule_id", "")
+            sid = it.get("schedule_id", "")
+            if not sid:
+                continue
+            all_ids.append(sid)
+            label = (it.get("label") or sid).strip()
             sub = it.get("subtitle") or ""
-            text = f"{label}\n{sub}" if sub else label
-            options.append(
-                {
-                    "text": {"tag": "plain_text", "content": text[:80]},
-                    "value": it.get("schedule_id", ""),
-                    "default_checked": bool(it.get("default_selected")),
-                }
-            )
-        if options:
+            info = f"**{label}**"
+            if sub:
+                info += f"\n<font color='grey'>{sub}</font>"
+            elements.append({"tag": "markdown", "content": info})
             elements.append(
-                {
-                    "tag": "checkboxes",
-                    "name": "schedule_ids",
-                    "options": options,
-                }
+                _button(
+                    f"取消此项：{label[:30]}",
+                    "danger",
+                    {
+                        "source": "game_data_ai",
+                        "action": "schedule_cancel_confirm",
+                        "token": token,
+                        "schedule_id": sid,
+                    },
+                )
+            )
+        if len(all_ids) > 1:
+            elements.append({"tag": "hr"})
+            elements.append(
+                _button(
+                    "取消全部",
+                    "danger",
+                    {
+                        "source": "game_data_ai",
+                        "action": "schedule_cancel_confirm",
+                        "token": token,
+                        "schedule_ids": all_ids,
+                    },
+                )
             )
         elements.append(
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "确认取消"},
-                "type": "danger",
-                "value": {
-                    "source": "game_data_ai",
-                    "action": "schedule_cancel_confirm",
-                    "token": token,
-                },
-            }
-        )
-        elements.append(
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "放弃"},
-                "type": "default",
-                "value": {
+            _button(
+                "放弃",
+                "default",
+                {
                     "source": "game_data_ai",
                     "action": "schedule_cancel_abort",
                     "token": token,
                 },
-            }
+            )
         )
 
     return {
