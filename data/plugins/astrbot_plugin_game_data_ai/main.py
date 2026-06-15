@@ -102,8 +102,11 @@ class GameDataAIPlugin(star.Star):
             pass
         logger.info("[game_data_ai] 已注册飞书卡片按钮回调 card.action.trigger")
 
-    async def _send_card_from_action(self, _event, card_json: dict, chat_id: str) -> None:
-        """从 card.action.trigger 异步下发追问卡片（不依赖 LarkMessageEvent）。"""
+    async def _send_card_from_action(
+        self, _event, card_json: dict, chat_id: str, label: str = "correction_card"
+    ) -> None:
+        """通用主动下发卡片（不依赖 LarkMessageEvent）。label 决定日志名，便于区分
+        追问纠错卡 / 会话关闭提示 / 定时洞察 等不同用途（默认追问纠错卡）。"""
         try:
             from astrbot.core.platform.sources.lark.lark_adapter import (
                 LarkPlatformAdapter,
@@ -132,12 +135,16 @@ class GameDataAIPlugin(star.Star):
                 receive_id_type="chat_id",
             )
             if ok:
-                logger.info(f"[game_data_ai] lark.correction_card_sent chat={chat_id}")
+                logger.info(f"[game_data_ai] lark.{label}_sent chat={chat_id}")
             else:
-                logger.warning("[game_data_ai] lark.correction_card_sent failed")
+                # 发送失败（含机器人已不在会话 230002，core 已降级为 warning）：此类系统/
+                # 运营卡片非关键，降为 debug，不重试也不污染日志。
+                logger.debug(
+                    f"[game_data_ai] lark.{label}_skipped chat={chat_id} (send failed)"
+                )
             return ok
         except Exception as e:
-            logger.warning(f"[game_data_ai] 追问卡片发送失败: {e}")
+            logger.warning(f"[game_data_ai] {label} 发送失败: {e}")
             return False
 
     async def terminate(self) -> None:
@@ -169,12 +176,12 @@ class GameDataAIPlugin(star.Star):
                         message=message,
                         idle_minutes=idle_min,
                     )
-                    ok = await self._send_card_from_action(None, card, chat_id)
-                    if ok:
-                        logger.info(
-                            f"[game_data_ai] lark.session_closed_notice chat={chat_id} "
-                            f"idle_min={idle_min}"
-                        )
+                    # 单次发送 + 单条日志（lark.session_closed_notice_sent）。此前 helper 内还会
+                    # 多打一条 lark.correction_card_sent，看起来像"重复发了两次关闭消息"——实际
+                    # 只发了一张卡，是日志重复且命名错误。
+                    await self._send_card_from_action(
+                        None, card, chat_id, label="session_closed_notice"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -287,7 +294,9 @@ class GameDataAIPlugin(star.Star):
                     title = header.get("title") or {}
                     title["content"] = "【定时洞察】" + (title.get("content") or "分析结果")
                     header["template"] = "wathet"
-                    ok = await self._send_card_from_action(None, card, chat_id)
+                    ok = await self._send_card_from_action(
+                        None, card, chat_id, label="scheduled_insight"
+                    )
                     if ok:
                         await self.client.ack_delivery(int(item.get("id") or 0))
             except asyncio.CancelledError:
@@ -569,7 +578,7 @@ class GameDataAIPlugin(star.Star):
                 out.append("请补充项目名后重试，例如：「仙魔项目活动流水怎么样？」")
             return out
 
-        if status != "answered":
+        if status not in ("answered", "awaiting_clarification"):
             err = payload.get("error") or {}
             return [
                 build_denied_plain(err)
@@ -577,7 +586,8 @@ class GameDataAIPlugin(star.Star):
                 else card_json_to_plain_fallback(payload)
             ]
 
-        self._active_data_chats[chat_id] = time.time()
+        if status == "answered":
+            self._active_data_chats[chat_id] = time.time()
         from game_data_ai.cards import build_result_cards_json
 
         cards = build_result_cards_json(payload)
@@ -736,22 +746,47 @@ class GameDataAIPlugin(star.Star):
             yield event.plain_result(build_progress_plain())
 
         async def _close_progress(text: str) -> None:
-            """停止动画、写入最终文字并关闭 streaming_mode；无卡片时静默返回。"""
+            """停止动画、写入最终文字并关闭 streaming_mode；无卡片时静默返回。
+
+            关键健壮性：飞书 CardKit 的 acontent/asettings 调用本身没有超时兜底，一旦该
+            接口卡住（无响应），会把后续「构建并下发真正的答案卡」整条链路一起堵死——
+            用户现象就是进度卡长期停在「正在分析中」，而后端其实早已 status=answered。
+            进度卡只是装饰，关不掉也必须放行到下游交付答案，故这里对每个飞书调用与 ticker
+            回收都加 asyncio.wait_for 超时，保证本函数在有限时间内返回。"""
             nonlocal progress_seq, progress_ticker
+            try:
+                close_to = float(
+                    os.getenv("GAME_DATA_AI_PROGRESS_CLOSE_TIMEOUT_SEC", "6")
+                )
+            except ValueError:
+                close_to = 6.0
+            if close_to <= 0:
+                close_to = 6.0
             if progress_ticker is not None:
                 progress_ticker.cancel()
                 try:
-                    await progress_ticker
-                except (asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(progress_ticker, timeout=close_to)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
                 progress_ticker = None
             if not progress_card_id or not isinstance(event, LarkMessageEvent):
                 return
             try:
                 progress_seq += 1
-                await event._update_streaming_text(progress_card_id, text, progress_seq)
+                await asyncio.wait_for(
+                    event._update_streaming_text(progress_card_id, text, progress_seq),
+                    timeout=close_to,
+                )
                 progress_seq += 1
-                await event._close_streaming_mode(progress_card_id, progress_seq)
+                await asyncio.wait_for(
+                    event._close_streaming_mode(progress_card_id, progress_seq),
+                    timeout=close_to,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[game_data_ai] 关闭流式进度卡片超时（飞书 CardKit 无响应），"
+                    "跳过进度卡、继续下发答案卡"
+                )
             except Exception as _exc:
                 logger.warning(f"[game_data_ai] 关闭流式进度卡片失败: {_exc}")
 
