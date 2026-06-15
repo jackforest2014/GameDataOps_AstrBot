@@ -144,7 +144,7 @@ class GameDataAIClient:
             f"user={feishu_user_id} msg={feishu_message_id} "
             f"attachments={len(attachments or [])} question={question[:80]}"
         )
-        timeout = float(os.getenv("GAME_DATA_AI_QUERY_TIMEOUT_SEC", "90"))
+        timeout = float(os.getenv("GAME_DATA_AI_QUERY_TIMEOUT_SEC", "180"))
         payload = await self._post_json(
             path,
             body_obj,
