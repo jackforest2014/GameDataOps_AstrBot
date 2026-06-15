@@ -122,7 +122,19 @@ class LarkMessageEvent(AstrMessageEvent):
             response = await lark_client.im.v1.message.acreate(request)
 
         if not response.success():
-            logger.error(f"[Lark] 发送飞书消息失败({response.code}): {response.msg}")
+            # 230001/230002/230005：机器人不在该会话（群已解散 / 被移出群 / 单聊被删或无会话）。
+            # 这是预期的外部状态而非可处理的故障（典型场景：session 闲置关闭后补发系统提示卡，
+            # 此时机器人可能已退出会话），降为 warning 以免污染错误日志。
+            benign_codes = {230001, 230002, 230005}
+            if response.code in benign_codes:
+                logger.warning(
+                    f"[Lark] 跳过发送：机器人不在会话内(code={response.code}) "
+                    f"receive_id={receive_id}"
+                )
+            else:
+                logger.error(
+                    f"[Lark] 发送飞书消息失败({response.code}): {response.msg}"
+                )
             return False
 
         return True
