@@ -79,6 +79,10 @@ class GameDataAIPlugin(star.Star):
         self._cancel_candidates: dict[str, list[str]] = {}
         # chat_id -> unix time of last successful query (for date follow-ups)
         self._active_data_chats: dict[str, float] = {}
+        # chat_id -> 来源 Lark 平台实例 id（如 lark-Chris）。多应用部署下，主动下发卡片
+        # 必须用"当初接待该会话的那个应用"发送，否则别的应用不在该会话里，飞书会返回
+        # 230002（机器人不在会话内）。收消息时登记，主动发卡时按 chat_id 路由。
+        self._chat_platform: dict[str, str] = {}
         # trace_id -> {chat_id, message_id, confirm_shown}
         self._doc_sessions: dict[str, dict] = {}
         self._user_active_trace: dict[str, str] = {}
@@ -106,7 +110,12 @@ class GameDataAIPlugin(star.Star):
         self, _event, card_json: dict, chat_id: str, label: str = "correction_card"
     ) -> None:
         """通用主动下发卡片（不依赖 LarkMessageEvent）。label 决定日志名，便于区分
-        追问纠错卡 / 会话关闭提示 / 定时洞察 等不同用途（默认追问纠错卡）。"""
+        追问纠错卡 / 会话关闭提示 / 定时洞察 等不同用途（默认追问纠错卡）。
+
+        多 Lark 应用部署：必须用"当初接待该会话的那个应用"发卡，否则别的应用不在该
+        会话里，飞书会返回 230002（机器人不在会话内）。按 chat_id→来源应用映射路由；
+        无映射（如重启后或定时洞察）时回退为遍历所有 Lark 应用逐个尝试——用错应用只会
+        被飞书拒为 230002，不会误投递给其它会话，发成功即止并回写映射。"""
         try:
             from astrbot.core.platform.sources.lark.lark_adapter import (
                 LarkPlatformAdapter,
@@ -114,38 +123,54 @@ class GameDataAIPlugin(star.Star):
             from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
         except ImportError:
             return False
-        adapter = None
-        for inst in self.context.platform_manager.get_insts():
-            if isinstance(inst, LarkPlatformAdapter):
-                adapter = inst
-                break
-        if adapter is None:
-            logger.warning("[game_data_ai] 未找到 Lark 适配器，追问卡片未发送")
+        lark_adapters = [
+            inst
+            for inst in self.context.platform_manager.get_insts()
+            if isinstance(inst, LarkPlatformAdapter)
+        ]
+        if not lark_adapters:
+            logger.warning("[game_data_ai] 未找到 Lark 适配器，卡片未发送")
             return False
-        lark_api = getattr(adapter, "lark_api", None)
-        if lark_api is None:
-            logger.warning("[game_data_ai] Lark API 客户端不可用")
-            return False
-        try:
-            ok = await LarkMessageEvent._send_interactive_card(
-                card_json,
-                lark_client=lark_api,
-                reply_message_id=None,
-                receive_id=chat_id,
-                receive_id_type="chat_id",
-            )
-            if ok:
-                logger.info(f"[game_data_ai] lark.{label}_sent chat={chat_id}")
-            else:
-                # 发送失败（含机器人已不在会话 230002，core 已降级为 warning）：此类系统/
-                # 运营卡片非关键，降为 debug，不重试也不污染日志。
-                logger.debug(
-                    f"[game_data_ai] lark.{label}_skipped chat={chat_id} (send failed)"
+        # 命中来源应用的排最前；其余仅作为无映射时的回退候选。
+        target_pid = self._chat_platform.get(chat_id)
+        ordered = sorted(
+            lark_adapters,
+            key=lambda a: 0 if target_pid and a.meta().id == target_pid else 1,
+        )
+        for adapter in ordered:
+            lark_api = getattr(adapter, "lark_api", None)
+            if lark_api is None:
+                continue
+            app_id = adapter.meta().id
+            try:
+                ok = await LarkMessageEvent._send_interactive_card(
+                    card_json,
+                    lark_client=lark_api,
+                    reply_message_id=None,
+                    receive_id=chat_id,
+                    receive_id_type="chat_id",
                 )
-            return ok
-        except Exception as e:
-            logger.warning(f"[game_data_ai] {label} 发送失败: {e}")
-            return False
+            except Exception as e:
+                logger.warning(
+                    f"[game_data_ai] {label} 发送失败(app={app_id}): {e}"
+                )
+                continue
+            if ok:
+                logger.info(
+                    f"[game_data_ai] lark.{label}_sent chat={chat_id} app={app_id}"
+                )
+                self._chat_platform[chat_id] = app_id
+                return True
+            # 已确定来源应用却失败（机器人真的不在该会话，如被移出/单聊删除）：不再拿
+            # 别的应用盲试，避免无谓的跨应用 230002。无映射时继续尝试下一个候选。
+            if target_pid:
+                break
+        # 发送失败（含 230002，core 已降级为 warning）：此类系统/运营卡片非关键，
+        # 降为 debug，不重试也不污染日志。
+        logger.debug(
+            f"[game_data_ai] lark.{label}_skipped chat={chat_id} (send failed)"
+        )
+        return False
 
     async def terminate(self) -> None:
         self._notify_stop.set()
@@ -234,6 +259,15 @@ class GameDataAIPlugin(star.Star):
         text = (event.message_str or "").strip()
 
         user_id, chat_id, message_id = _feishu_ids(event)
+
+        # 登记该会话的来源 Lark 应用，供后续主动发卡（会话结束 / 反馈 / 定时洞察）按
+        # chat_id 路由到正确应用，避免多应用下误用别的应用导致 230002。
+        try:
+            platform_id = event.platform_meta.id if event.platform_meta else ""
+            if chat_id and platform_id:
+                self._chat_platform[chat_id] = platform_id
+        except Exception:
+            pass
 
         if msg_type == MessageType.GROUP_MESSAGE:
             route = await resolve_route(
