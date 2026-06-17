@@ -123,6 +123,14 @@ class GameDataAIPlugin(star.Star):
             from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
         except ImportError:
             return False
+        # 仅对真实飞书会话（chat_id 以 oc_ 开头）发卡。评测/合成 id（如 cmd/eval 的
+        # eval_runner）不是真实会话，发必失败；若放任回退会逐个试所有应用，徒增 230001/
+        # 权限错误噪声并浪费调用，故在此直接跳过。
+        if not chat_id or not chat_id.startswith("oc_"):
+            logger.debug(
+                f"[game_data_ai] lark.{label}_skipped chat={chat_id} (非飞书会话)"
+            )
+            return False
         lark_adapters = [
             inst
             for inst in self.context.platform_manager.get_insts()
