@@ -20,6 +20,7 @@ async def resolve_route(
     chat_id: str,
     message_id: str,
     active_data_chats: dict[str, float] | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Return query | schedule | cancel | list_schedules | ignore."""
     t = (text or "").strip()
@@ -42,7 +43,7 @@ async def resolve_route(
                 feishu_chat_id=chat_id,
                 feishu_message_id=message_id or f"route_{int(time.time())}",
                 question=t,
-                session_id=f"sess_{chat_id}" if chat_id else None,
+                session_id=session_id or (f"sess_{chat_id}" if chat_id else None),
             )
             route = (payload.get("route") or "ignore").strip().lower()
             if route in (

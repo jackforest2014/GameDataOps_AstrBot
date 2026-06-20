@@ -86,6 +86,12 @@ def register_feedback_card_handler(
             await _handle_schedule_cancel(
                 client, send_card, event, value, feishu_user_id, chat_id, store
             )
+            return None
+
+        if action == "overseas_scope_confirm":
+            await _handle_overseas_scope_confirm(
+                client, send_card, event, value, feishu_user_id, chat_id
+            )
         return None
 
 
@@ -253,3 +259,40 @@ async def _handle_schedule_cancel(
             await send_card(event, build_cancel_success_card(resp), chat_id)
     except Exception as e:
         logger.error(f"[game_data_ai] schedule.cancel_confirm failed: {e}", exc_info=True)
+
+
+async def _handle_overseas_scope_confirm(
+    client: GameDataAIClient,
+    send_card: SendCardFn | None,
+    event: P2CardActionTrigger,
+    value: dict[str, Any],
+    feishu_user_id: str,
+    chat_id: str,
+) -> None:
+    option_id = (value.get("option_id") or "").strip()
+    session_id = (value.get("session_id") or "").strip()
+    if not option_id or not feishu_user_id:
+        return
+    msg_id = ""
+    try:
+        ctx = event.event.context if event.event else None
+        msg_id = getattr(ctx, "open_message_id", None) or f"scope_{option_id[:12]}"
+    except Exception:
+        msg_id = f"scope_{option_id[:12]}"
+    try:
+        payload = await client.chat_messages(
+            feishu_user_id=feishu_user_id,
+            feishu_chat_id=chat_id,
+            feishu_message_id=msg_id,
+            question=option_id,
+            chat_type="p2p",
+            session_id=session_id or None,
+        )
+        if send_card and chat_id:
+            from game_data_ai.cards import build_result_cards_json
+
+            for card in build_result_cards_json(payload):
+                await send_card(event, card, chat_id)
+    except Exception as e:
+        logger.error(f"[game_data_ai] overseas_scope.confirm failed: {e}", exc_info=True)
+

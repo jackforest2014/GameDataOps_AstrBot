@@ -49,6 +49,8 @@ from game_data_ai.schedule_cancel_card import (
     build_cancel_preview_card,
     build_schedule_created_card,
 )
+from game_data_ai.overseas_scope_card import build_overseas_scope_clarify_card
+from game_data_ai.session_cache import ChatSessionStore
 from game_data_ai.session_notice import build_session_closed_card_json
 
 
@@ -83,6 +85,7 @@ class GameDataAIPlugin(star.Star):
         # 必须用"当初接待该会话的那个应用"发送，否则别的应用不在该会话里，飞书会返回
         # 230002（机器人不在会话内）。收消息时登记，主动发卡时按 chat_id 路由。
         self._chat_platform: dict[str, str] = {}
+        self._chat_sessions = ChatSessionStore()
         # trace_id -> {chat_id, message_id, confirm_shown}
         self._doc_sessions: dict[str, dict] = {}
         self._user_active_trace: dict[str, str] = {}
@@ -203,6 +206,9 @@ class GameDataAIPlugin(star.Star):
                     chat_id = item.get("feishu_chat_id") or ""
                     message = item.get("message") or ""
                     idle_min = int(item.get("idle_minutes") or 1)
+                    new_session_id = item.get("new_session_id") or ""
+                    if new_session_id and chat_id:
+                        self._chat_sessions.update(chat_id, new_session_id)
                     if not chat_id or not message:
                         continue
                     card = build_session_closed_card_json(
@@ -294,6 +300,7 @@ class GameDataAIPlugin(star.Star):
         if msg_type != MessageType.FRIEND_MESSAGE:
             return
 
+        session_id = self._chat_sessions.get(chat_id)
         route = await resolve_route(
             self.client,
             text,
@@ -301,6 +308,7 @@ class GameDataAIPlugin(star.Star):
             chat_id=chat_id,
             message_id=message_id,
             active_data_chats=self._active_data_chats,
+            session_id=session_id,
         )
         if route in ("ignore", ""):
             return
@@ -628,6 +636,20 @@ class GameDataAIPlugin(star.Star):
                 else card_json_to_plain_fallback(payload)
             ]
 
+        if status == "awaiting_clarification":
+            clar = payload.get("clarification") or {}
+            if clar.get("kind") == "overseas_scope":
+                card = build_overseas_scope_clarify_card(
+                    {**payload, "feishu_chat_id": chat_id}
+                )
+                sent = False
+                if event is not None:
+                    sent = await self._try_send_lark_card(event, card, chat_id, "")
+                if not sent:
+                    sent = await self._send_card_from_action(None, card, chat_id)
+                if sent:
+                    return []
+
         if status == "answered":
             self._active_data_chats[chat_id] = time.time()
         from game_data_ai.cards import build_result_cards_json
@@ -673,8 +695,9 @@ class GameDataAIPlugin(star.Star):
                 feishu_message_id=message_id,
                 question=question,
                 chat_type="p2p",
-                session_id=f"sess_{chat_id}",
+                session_id=self._chat_sessions.get(chat_id),
             )
+            self._chat_sessions.update(chat_id, payload.get("session_id"))
         except Exception as e:
             logger.error(f"[game_data_ai] chitchat API 调用失败: {e}")
             yield event.plain_result(f"平台暂时不可用：{e}")
@@ -839,7 +862,7 @@ class GameDataAIPlugin(star.Star):
                 feishu_message_id=message_id,
                 question=question,
                 chat_type="p2p",
-                session_id=f"sess_{chat_id}",
+                session_id=self._chat_sessions.get(chat_id),
                 attachments=attachments or None,
             )
         except Exception as e:
@@ -847,6 +870,8 @@ class GameDataAIPlugin(star.Star):
             logger.error(f"[game_data_ai] API 调用失败: {e}")
             yield event.plain_result(f"平台暂时不可用：{e}")
             return
+
+        self._chat_sessions.update(chat_id, payload.get("session_id"))
 
         status = payload.get("status")
         trace_id = str(payload.get("trace_id") or "")
