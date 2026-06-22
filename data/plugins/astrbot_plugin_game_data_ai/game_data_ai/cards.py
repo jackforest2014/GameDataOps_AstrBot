@@ -1911,6 +1911,26 @@ def build_progress_plain() -> str:
     return "已收到，正在分析中，请稍候…"
 
 
+def build_progress_card(content: str = "") -> dict[str, Any]:
+    """A lightweight 处理中 card for paths that can't use the streaming card
+    (e.g. card.action.trigger 澄清按钮回调)，so点击按钮后立刻有「正在分析」反馈，
+    避免长查询期间用户以为机器人挂掉。"""
+    text = (content or "").strip() or "已收到，正在汇总数据，请稍候…"
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "正在分析"},
+            "template": "blue",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": f"⏳ {text}"},
+            ]
+        },
+    }
+
+
 def build_p2p_only_plain() -> str:
     return "【当前仅支持飞书单聊】\n请在飞书应用中与机器人单聊提问，群聊暂不支持问数（p2p_only）。"
 

@@ -279,6 +279,16 @@ async def _handle_overseas_scope_confirm(
         msg_id = getattr(ctx, "open_message_id", None) or f"scope_{option_id[:12]}"
     except Exception:
         msg_id = f"scope_{option_id[:12]}"
+    # 澄清按钮回调走的是 card.action.trigger（非 LarkMessageEvent），无法复用消息路径的
+    # 流式进度卡。海外大盘聚合可能要数十秒，期间没有任何反馈用户会以为机器人挂掉。先即时
+    # 回一张「正在分析」卡片作为反馈，再等后端结果。
+    if send_card and chat_id:
+        try:
+            from game_data_ai.cards import build_progress_card
+
+            await send_card(event, build_progress_card("正在汇总海外大盘数据，请稍候…"), chat_id)
+        except Exception as e:
+            logger.warning(f"[game_data_ai] overseas_scope.progress_card failed: {e}")
     try:
         payload = await client.chat_messages(
             feishu_user_id=feishu_user_id,
