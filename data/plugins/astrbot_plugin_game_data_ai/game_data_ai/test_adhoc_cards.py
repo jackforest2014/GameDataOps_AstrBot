@@ -172,6 +172,80 @@ def test_adhoc_table_element_native_text_and_freeze():
     assert el["rows"][0]["prop_name"] == "198元灵武召唤礼包"
 
 
+def _collect_chart_element_ids(node) -> list[str]:
+    """递归收集卡片里所有 tag=='chart' 元素的 element_id。"""
+    found: list[str] = []
+    if isinstance(node, dict):
+        if node.get("tag") == "chart" and node.get("element_id"):
+            found.append(node["element_id"])
+        for v in node.values():
+            found.extend(_collect_chart_element_ids(v))
+    elif isinstance(node, list):
+        for v in node:
+            found.extend(_collect_chart_element_ids(v))
+    return found
+
+
+def _multidim_bar(col: str, label: str) -> dict:
+    """模拟后端多维拆分图：chart_id 均为 multidim_*（归一化后同为「multid」）。"""
+    return {
+        "chart_id": f"multidim_{col}",
+        "type": "bar",
+        "direction": "horizontal",
+        "title": f"{label}拆分 · 昨日流水(人民币元)",
+        "labels": ["A", "B"],
+        "datasets": [{"name": "流水(人民币元)", "values": [10.0, 20.0]}],
+    }
+
+
+def test_adhoc_multidim_card_chart_element_ids_unique():
+    """多维拆分卡片：顶层 charts（第 1 维）与各 section 图（后续维）chart_id 归一化后同名，
+    必须共享去重集合，保证 ElementID 全局唯一，否则飞书 300301「Duplicate ID」整卡失败。"""
+    payload = {
+        "trace_id": "tr_multidim",
+        "session_id": "sess_1",
+        "answer": {
+            "title": "HiggsDomino · 昨日 · 多维度流水拆分",
+            "summary": "按 3 个维度拆分。",
+            "query_mode": "adhoc_multidim",
+            "adhoc_table": {
+                "columns": [{"key": "name", "label": "支付渠道", "type": "string"}],
+                "rows": [{"name": "A"}],
+                "row_count": 1,
+            },
+            "charts": [_multidim_bar("infull_type", "支付渠道")],
+            "sections": [
+                {
+                    "stage_index": 1,
+                    "title": "发布渠道拆分",
+                    "summary": "按发布渠道拆分。",
+                    "adhoc_table": {
+                        "columns": [{"key": "name", "label": "发布渠道", "type": "string"}],
+                        "rows": [{"name": "X"}],
+                        "row_count": 1,
+                    },
+                    "charts": [_multidim_bar("channel_type", "发布渠道")],
+                },
+                {
+                    "stage_index": 2,
+                    "title": "平台拆分",
+                    "summary": "按平台拆分。",
+                    "adhoc_table": {
+                        "columns": [{"key": "name", "label": "平台", "type": "string"}],
+                        "rows": [{"name": "iOS"}],
+                        "row_count": 1,
+                    },
+                    "charts": [_multidim_bar("platform", "平台")],
+                },
+            ],
+        },
+    }
+    card = build_adhoc_result_card_json(payload)
+    ids = _collect_chart_element_ids(card)
+    assert len(ids) == 3, f"应渲染 3 张图，实得 {len(ids)}：{ids}"
+    assert len(ids) == len(set(ids)), f"图表 ElementID 必须唯一，实得重复：{ids}"
+
+
 def test_build_adhoc_result_card_json_uses_native_table():
     card = build_adhoc_result_card_json(
         {

@@ -8,7 +8,30 @@
 
 ---
 
-## 目的
+## Worktree 布局（2026-06-24 已就绪）
+
+| 目录 | 分支 | WebUI | Go API |
+|------|------|-------|--------|
+| `GameDataOps_AstrBot` | **`dev`**（legacy） | **6185** | `:8080` |
+| `GameDataOps_AstrBot-v2` | **`feat/conversational-analysis-refinement`** | **6285** | `:8180` |
+
+v2 实例 `data/` 从 legacy 复制，`dashboard.port` 已改为 **6285**。
+
+启动 v2 AstrBot：
+
+```powershell
+cd C:\Users\wangbenlin\Documents\GameDataOps_AstrBot-v2
+.\scripts\v2-run.ps1 run
+```
+
+或从 Go v2 worktree：
+
+```powershell
+cd C:\Users\wangbenlin\Documents\game_data_ai-conversational-refinement
+.\scripts\astrbot-v2.ps1 run
+```
+
+---
 
 本地 **legacy**（`:8080` + AstrBot WebUI `6185`）继续服务日常问数；**v2** 栈（`:8180` + WebUI `6285`）开发 analysisv2 / Neo4j 知识库，两实例互不抢占端口。
 
@@ -19,7 +42,7 @@
 | 变量 | Legacy 实例 | v2 实例 |
 |------|-------------|---------|
 | `GAME_DATA_AI_BASE_URL` | `http://127.0.0.1:8080` | **`http://127.0.0.1:8180`** |
-| `GAME_DATA_AI_SERVICE_TOKEN` | 与 Go `.env` 一致 | 与 Go **`.env.v2`** 一致 |
+| `GAME_DATA_AI_SERVICE_TOKEN` | 与 Go `.env` 一致 | 与 Go **v2 worktree `.env`** 一致 |
 | `GAME_DATA_AI_SHARED_SECRET` | 同上 | 同上 |
 
 可在启动 AstrBot 前于 PowerShell 设置：

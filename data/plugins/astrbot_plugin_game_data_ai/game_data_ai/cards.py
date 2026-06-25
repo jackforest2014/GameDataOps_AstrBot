@@ -1503,6 +1503,15 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
         {"tag": "markdown", "content": f"**摘要**\n{summary or '（无摘要）'}"},
     ]
     _append_answer_notices(elements, answer)
+    sections = answer.get("sections") or []
+    table_seq = [0]
+    native_budget = [_MAX_FEISHU_NATIVE_TABLES]
+    # 整张卡片共享一个图表 ElementID 去重集合，保证 ID 全局唯一。
+    used_section_chart_ids: set[str] = set()
+    # 顶层 charts 与各 section 的图必须共用同一个去重集合：多维拆分（adhoc_multidim）时
+    # 顶层 charts 是第 1 个维度的图、后续维度在 sections 里，两处若各用一套集合都从 seq=0
+    # 起算，且多维图 chart_id（multidim_*）归一化后同为「multid」，会生成相同 ElementID
+    #（如 gmultid0），触发飞书 300301「Duplicate ID」整卡创建失败。
     # 只在没有 illustrated_facts（每指标内嵌图）时才渲染顶层汇总图表块。
     if charts and not illustrated_facts:
         _append_chart_blocks(
@@ -1511,11 +1520,8 @@ def build_adhoc_result_card_json(payload: dict[str, Any]) -> dict[str, Any]:
             max_charts=3,
             heading="**图表**",
             trace_id=trace_id,
+            used_chart_ids=used_section_chart_ids,
         )
-    sections = answer.get("sections") or []
-    table_seq = [0]
-    native_budget = [_MAX_FEISHU_NATIVE_TABLES]
-    used_section_chart_ids: set[str] = set()
     if not chart_only:
         adhoc_tbl = answer.get("adhoc_table")
         if adhoc_tbl:
